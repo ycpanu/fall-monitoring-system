@@ -23,16 +23,21 @@ if(NOT nlohmann_json_FOUND)
     endif()
 endif()
 
+# 摄像头采集依赖 OpenCV；通过 -DOpenCV_DIR 指向板端 sysroot 的 CMake 包。
+find_package(OpenCV REQUIRED COMPONENTS core videoio)
+
 add_library(fall_monitoring_core STATIC
     src/app/Application.cpp
+    src/infrastructure/camera/CameraCapture.cpp
     src/infrastructure/config/ConfigManager.cpp
     src/infrastructure/logging/Logger.cpp
 )
 
 target_include_directories(fall_monitoring_core PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    ${OpenCV_INCLUDE_DIRS})
 
-target_link_libraries(fall_monitoring_core PUBLIC spdlog::spdlog)
+target_link_libraries(fall_monitoring_core PUBLIC spdlog::spdlog ${OpenCV_LIBS})
 if(nlohmann_json_FOUND)
     target_link_libraries(fall_monitoring_core PUBLIC nlohmann_json::nlohmann_json)
 endif()

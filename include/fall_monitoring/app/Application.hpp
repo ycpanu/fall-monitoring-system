@@ -13,6 +13,6 @@ namespace fall_monitoring::app
     {
     public:
         // 启动应用，返回进程退出码
-        int run();
+        int run(int argc, char* argv[]);
     };
 } // namespace fall_monitoring::app
