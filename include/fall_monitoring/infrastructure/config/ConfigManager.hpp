@@ -1,6 +1,6 @@
 #pragma once
 
-#include <nlothmann/json.hpp>
+#include <nlohmann/json.hpp>
 #include <string>
 
 namespace fall_monitoring::infrastructure::config

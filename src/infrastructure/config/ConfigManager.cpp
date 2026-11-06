@@ -48,7 +48,7 @@ namespace fall_monitoring::infrastructure::config
         return node;
     }
 
-    std::string ConfigManager::getstring(const std::string& key, const std::string& fallback) const
+    std::string ConfigManager::getString(const std::string& key, const std::string& fallback) const
     {
         const auto* v = find(key);
         return v && v->is_string() ? v->get<std::string>() : fallback;

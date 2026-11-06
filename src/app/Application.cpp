@@ -16,7 +16,7 @@ namespace fall_monitoring::app
             return 1;
         }
 
-        infrastructure::Logging::Logger logger;
+        infrastructure::logging::Logger logger;
         if (!logger.initialize(config.getString("system.log_file_path", "logs/gateway.log"), config.getString("system.log_level", "INFO")))
         {
             return 1;
