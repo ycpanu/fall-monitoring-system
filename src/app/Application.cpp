@@ -1,15 +1,15 @@
 #include "fall_monitoring/app/Application.hpp"
+#include "fall_monitoring/application/vision/VisionPipeline.hpp"
 #include "fall_monitoring/concurrency/LatestFrameQueue.hpp"
 #include "fall_monitoring/infrastructure/camera/CameraCapture.hpp"
 #include "fall_monitoring/infrastructure/config/ConfigManager.hpp"
 #include "fall_monitoring/infrastructure/logging/Logger.hpp"
+#include "fall_monitoring/infrastructure/rknn/RknnPoseInferencer.hpp"
 
 #include <opencv2/core.hpp>
 #include <spdlog/spdlog.h>
 
-#include <chrono>
 #include <csignal>
-#include <cstdint>
 #include <exception>
 #include <iostream>
 
@@ -55,62 +55,46 @@ namespace fall_monitoring::app
             return 1;
         }
 
+        const std::string modelPath = config.getString("model.rknn_model_path", "./models/yolov8n-pose-512-hybrid.rknn");
+        const float confidenceThreshold = static_cast<float>(config.getDouble("model.confidence_threshold", 0.5));
+        const float nmsThreshold = static_cast<float>(config.getDouble("model.nms_threshold", 0.45));
+
         try
         {
-            // Application 创建队列和设备适配器，按声明顺序保证生命周期
+            // 组合根：Application 按依赖顺序创建队列、NPU、流水线与摄像头。
             concurrency::LatestFrameQueue<cv::Mat> frames(static_cast<std::size_t>(queueSize));
+            infrastructure::rknn::RknnPoseInferencer inferencer(modelPath, confidenceThreshold, nmsThreshold);
+
+            if (!inferencer.initialize())
+            {
+                SPDLOG_ERROR("[App] NPU 姿态推理初始化失败，停止启动");
+                return 1;
+            }
+            application::vision::VisionPipeline pipeline(inferencer, frames);
+
             infrastructure::camera::CameraOptions cameraOptions;
             cameraOptions.deviceId = config.getInt("vision.camera_device_id", 0);
-
-            if (argc == 2)
-            {
-                cameraOptions.videoPath = argv[1];
-            }
-
+            if (argc == 2) cameraOptions.videoPath = argv[1];
             infrastructure::camera::CameraCapture camera(cameraOptions, frames);
 
-            // 在启动采集线程前注册退出信号
             keepRunning = 1;
             std::signal(SIGINT, onStopSignal);
             std::signal(SIGTERM, onStopSignal);
             if (!camera.start())
             {
-                SPDLOG_ERROR("[App] 视频采集模块启动失败");
+                SPDLOG_ERROR("[App] 摄像头采集启动失败");
                 return 1;
             }
 
-            using clock = std::chrono::steady_clock;
-            auto lastReport = clock::now();
-            std::uint64_t consumed = 0;
-            std::uint64_t lastConsumed = 0;
-            std::uint64_t lastCaptured = 0;
-            std::size_t lastDropped = 0;
-            while (keepRunning != 0 && camera.isRunning())
-            {
-                cv::Mat frame;
-                if (frames.waitPopFor(frame, std::chrono::milliseconds(500)))
-                {
-                    ++consumed;
-                }
-                const auto now = clock::now();
-                const auto elapsed = std::chrono::duration<double>(now - lastReport).count();
-                if (elapsed >= 10.0)
-                {
-                    const auto captured = camera.capturedCount();
-                    const auto dropped = frames.droppedCount();
-                    SPDLOG_INFO("[Camera] 近 {:.1f}s 采集={}帧, 消费={}帧, 丢旧帧={}, 队列剩余={}",
-                                elapsed, captured - lastCaptured, consumed - lastConsumed,
-                                dropped - lastDropped, frames.size());
-                    lastReport = now;
-                    lastCaptured = captured;
-                    lastConsumed = consumed;
-                    lastDropped = dropped;
-                }
-            }
+            // 关键点数据由流水线的检测回调交给未来的跟踪/规则服务。
+            pipeline.runUntil([&](){
+                return keepRunning != 0 && camera.isRunning();
+            });
 
-            SPDLOG_INFO("[App] 收到退出请求或采集已结束，开始关闭");
-            camera.stop();      // 先回收生产者，避免其访问已经销毁的队列。
-            frames.close();     // 唤醒潜在消费者；不静默覆盖报警队列。
+            // 停止生产者并回收线程，再关闭队列；析构逆序释放 NPU。
+            SPDLOG_INFO("[App] 开始关闭摄像头与视觉流水线");
+            camera.stop();
+            frames.close();
             SPDLOG_INFO("[App] 安全退出，总采集帧数={}", camera.capturedCount());
             return 0;
         }

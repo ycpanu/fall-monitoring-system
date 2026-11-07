@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(fall_monitoring_system VERSION 0.1.0 LANGUAGES CXX)
+project(fall_monitoring_system LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,9 +24,23 @@ if(NOT nlohmann_json_FOUND)
 endif()
 
 # 摄像头采集依赖 OpenCV；通过 -DOpenCV_DIR 指向板端 sysroot 的 CMake 包。
-find_package(OpenCV REQUIRED COMPONENTS core videoio)
+find_package(OpenCV REQUIRED COMPONENTS core videoio imgproc)
+
+# RKNN SDK 隔离在 Infrastructure 层，不暴露头文件给应用层。
+# 原工程依赖 sysroot/usr/include/rknn_api.h 和 sysroot/usr/lib/librknnrt.so。
+# 如果使用外部交叉工具链，也可通过 -DRKNN_INCLUDE_DIR/-DRKNN_LIBRARY 指定。
+find_path(RKNN_INCLUDE_DIR NAMES rknn_api.h
+    PATHS "${CMAKE_CURRENT_SOURCE_DIR}/sysroot/usr/include")
+find_library(RKNN_LIBRARY NAMES rknnrt
+    PATHS "${CMAKE_CURRENT_SOURCE_DIR}/sysroot/usr/lib"
+          "${CMAKE_CURRENT_SOURCE_DIR}/sysroot/usr/lib/aarch64-linux-gnu")
+if(NOT RKNN_INCLUDE_DIR OR NOT RKNN_LIBRARY)
+    message(FATAL_ERROR "找不到 RKNN SDK：请配置 RKNN_INCLUDE_DIR 与 RKNN_LIBRARY 或准备 sysroot")
+endif()
 
 add_library(fall_monitoring_core STATIC
+    src/application/vision/VisionPipeline.cpp
+    src/infrastructure/rknn/RknnPoseInferencer.cpp
     src/app/Application.cpp
     src/infrastructure/camera/CameraCapture.cpp
     src/infrastructure/config/ConfigManager.cpp
@@ -36,8 +50,13 @@ add_library(fall_monitoring_core STATIC
 target_include_directories(fall_monitoring_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     ${OpenCV_INCLUDE_DIRS})
+# RKNN SDK 仅用于具体实现，不能通过 PUBLIC 传播到领域与应用头文件。
+target_include_directories(fall_monitoring_core PRIVATE "${RKNN_INCLUDE_DIR}")
 
-target_link_libraries(fall_monitoring_core PUBLIC spdlog::spdlog ${OpenCV_LIBS})
+# 业务接口不包含 SDK；在静态核心库中 PRIVATE 依赖仍会传递最终链接要求。
+target_link_libraries(fall_monitoring_core
+    PUBLIC spdlog::spdlog ${OpenCV_LIBS}
+    PRIVATE "${RKNN_LIBRARY}")
 if(nlohmann_json_FOUND)
     target_link_libraries(fall_monitoring_core PUBLIC nlohmann_json::nlohmann_json)
 endif()
