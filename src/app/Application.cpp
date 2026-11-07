@@ -1,6 +1,7 @@
 #include "fall_monitoring/app/Application.hpp"
 #include "fall_monitoring/application/vision/VisionPipeline.hpp"
 #include "fall_monitoring/concurrency/LatestFrameQueue.hpp"
+#include "fall_monitoring/domain/vision/PersonTracker.hpp"
 #include "fall_monitoring/infrastructure/camera/CameraCapture.hpp"
 #include "fall_monitoring/infrastructure/config/ConfigManager.hpp"
 #include "fall_monitoring/infrastructure/logging/Logger.hpp"
@@ -70,7 +71,15 @@ namespace fall_monitoring::app
                 SPDLOG_ERROR("[App] NPU 姿态推理初始化失败，停止启动");
                 return 1;
             }
-            application::vision::VisionPipeline pipeline(inferencer, frames);
+
+            domain::vision::PersonTrackerConfig trackerConfig;
+            domain::vision::PersonTracker tracker(trackerConfig);
+            SPDLOG_INFO("[Tracker] 初始化: IoU={:.2f}, 中心距离={:.2f}, 保留={}ms",
+                        trackerConfig.iouThreshold,
+                        trackerConfig.centerDistanceThreshold,
+                        trackerConfig.maxMissingMs);
+
+            application::vision::VisionPipeline pipeline(inferencer, tracker, frames);
 
             infrastructure::camera::CameraOptions cameraOptions;
             cameraOptions.deviceId = config.getInt("vision.camera_device_id", 0);
@@ -86,11 +95,11 @@ namespace fall_monitoring::app
                 return 1;
             }
 
-            // 关键点数据由流水线的检测回调交给未来的跟踪/规则服务。
+            // 原始检测在 VisionPipeline 内完成 Track ID 关联。
             pipeline.runUntil([&](){
-                return keepRunning != 0 && camera.isRunning();
+                return keepRunning !=0 && camera.isRunning();
             });
-
+            
             // 停止生产者并回收线程，再关闭队列；析构逆序释放 NPU。
             SPDLOG_INFO("[App] 开始关闭摄像头与视觉流水线");
             camera.stop();

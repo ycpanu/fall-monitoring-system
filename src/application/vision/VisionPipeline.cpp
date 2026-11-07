@@ -9,7 +9,16 @@
 
 namespace fall_monitoring::application::vision
 {
-    VisionPipeline::VisionPipeline(application::ports::IPoseInferencer& inferencer, FrameQueue& frames, DetectionHandler onDetection) : inferencer_(inferencer), frames_(frames), onDetection_(std::move(onDetection))
+    VisionPipeline::VisionPipeline(application::ports::IPoseInferencer& inferencer,
+                                   domain::vision::PersonTracker& tracker,
+                                   FrameQueue& frames,
+                                   DetectionHandler onDetection,
+                                   TrackingHandler onTracked)
+        : inferencer_(inferencer),
+          tracker_(tracker),
+          frames_(frames),
+          onDetection_(std::move(onDetection)),
+          onTracked_(std::move(onTracked))
     {
     }
 
@@ -56,14 +65,33 @@ namespace fall_monitoring::application::vision
                 // RKNN 适配器负责输出具体失败码；流水线只记录累计失败数。
             }
 
+            // 没处理一帧都更新跟踪器；空结果只触发过期清理。
+            const auto tracked = tracker_.update(detections);
+            if (inferenceOk)
+            {
+                // 保留上一功能的原始检测回调，不破坏原有调用者接口。
+                if (onDetection_)
+                {
+                    onDetection_(frame, detections);
+                }
+                // 规则引擎后续接入此回调，不依赖 RKNN 的具体实现。
+                if (onTracked_)
+                {
+                    onTracked_(frame, tracked);
+                }
+            }
+
             const auto now = Clock::now();
             const double seconds = std::chrono::duration<double>(now - lastReport).count();
             if (seconds >= 10.0)
             {
                 const auto dropped = frames_.droppedCount();
-                SPDLOG_INFO("[Vision] {:.1f}s: 处理={}帧，成功={}，失败={}，检出人体={}，FPS={:.2f}，丢旧帧={}",
-                            seconds, frameCount, successCount, failedCount, personCount, static_cast<double>(frameCout) / seconds,
-                            dropped - lastDroppedCount);
+                SPDLOG_INFO(
+                    "[Vision] {:.1f}s: 处理={}帧, 推理成功={}, 失败={}, 检出人体={}, "
+                    "FPS={:.2f}, 活跃Track={}, 丢旧帧={}",
+                    seconds, frameCount, successCount, failedCount, personCount,
+                    static_cast<double>(frameCount) / seconds,
+                    tracker_.activeTrackCount(), dropped - lastDroppedCount);
                 lastReport = now;
                 frameCount = successCount = failedCount = personCount = 0;
                 lastDroppedCount = dropped;

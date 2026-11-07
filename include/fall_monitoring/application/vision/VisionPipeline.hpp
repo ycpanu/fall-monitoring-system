@@ -2,6 +2,7 @@
 
 #include "fall_monitoring/application/ports/IPoseInferencer.hpp"
 #include "fall_monitoring/concurrency/LatestFrameQueue.hpp"
+#include "fall_monitoring/domain/vision/PersonTracker.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -21,18 +22,26 @@ namespace fall_monitoring::application::vision
     public:
         using FrameQueue = concurrency::LatestFrameQueue<cv::Mat>;
         using DetectionHandler = std::function<void(const cv::Mat&, const std::vector<domain::vision::DetectResult>&)>
+        using TrackingHandler = std::function<void(const cv::Mat&, const std::vector<domain::vision::TrackedPerson>&)>;
 
-        VisionPipeline(application::ports::IPoseInferencer& inferencer, FrameQueue& frame, DetectionHandler onDetection = {});
+        VisionPipeline(application::ports::IPoseInferencer& inferencer,
+            domain::vision::PersonTracker& tracker, 
+            FrameQueue& frame, 
+            DetectionHandler onDetection = {},
+            TrackingHandler onTracked ={}
+        );
 
         /**
-         * @brief 在当前线程消费并推理，在 shouldContinue() 返回 true 时持续运行，返回 false 退出。
-         * @note 帧队列为非拥有引用，必须比此对象存活更久。
+         * @brief 在调用者线程持续消费帧，直到停止请求或队列关闭。
+         * @note 两种回调均在本线程同步执行，不可长期保存 frame 引用。
          */
-        void runUntil(const std::function<bool()>& stopRequested);
+        void runUntil(const std::function<bool()>& shouldContinue);
 
     private:
         application::ports::IPoseInferencer& inferencer_;
+        domain::vision::PersonTracker& tracker_;
         FrameQueue& frames_;
         DetectionHandler onDetection_;
+        TrackingHandler onTracked_;
     };
 }
