@@ -1,6 +1,7 @@
 #include "fall_monitoring/app/Application.hpp"
 #include "fall_monitoring/application/vision/VisionPipeline.hpp"
 #include "fall_monitoring/concurrency/LatestFrameQueue.hpp"
+#include "fall_monitoring/domain/vision/FallRuleEngine.hpp"
 #include "fall_monitoring/domain/vision/PersonTracker.hpp"
 #include "fall_monitoring/infrastructure/camera/CameraCapture.hpp"
 #include "fall_monitoring/infrastructure/config/ConfigManager.hpp"
@@ -13,6 +14,7 @@
 #include <csignal>
 #include <exception>
 #include <iostream>
+#include <utility>
 
 namespace
 {
@@ -60,6 +62,17 @@ namespace fall_monitoring::app
         const float confidenceThreshold = static_cast<float>(config.getDouble("model.confidence_threshold", 0.5));
         const float nmsThreshold = static_cast<float>(config.getDouble("model.nms_threshold", 0.45));
 
+        domain::vision::FallRuleConfig rules;
+        rules.kptConfThreshold = static_cast<float>(config.getDouble("rule_engine.kpt_conf_threshold", 0.3));
+        rules.fallAngleThreshold = static_cast<float>(config.getDouble("rule_engine.fall_angle_threshold", 60.0));
+        rules.recoveryAngleThreshold = static_cast<float>(config.getDouble("rule_engine.recovery_angle_threshold", 35.0));
+        rules.normalizedVelocityThreshold = static_cast<float>(config.getDouble("rule_engine.normalized_velocity_threshold", 0.6));
+        rules.normalizedCenterVelocityThreshold = static_cast<float>(config.getDouble("rule_engine.normalized_center_velocity_threshold", 0.5));
+        rules.suspectConfirmMs = config.getInt("rule_engine.suspect_confirm_ms", 1000);
+        rules.staticLieConfirmMs = config.getInt("rule_engine.static_lie_confirm_ms", 5000);
+        rules.fallEventWindowMs = config.getInt("rule_engine.fall_event_window_ms", 1500);
+        rules.safeZoneOverlapThreshold = static_cast<float>(config.getDouble("rule_engine.safe_zone_overlap_threshold", 0.5));
+
         try
         {
             // 组合根：Application 按依赖顺序创建队列、NPU、流水线与摄像头。
@@ -79,7 +92,19 @@ namespace fall_monitoring::app
                         trackerConfig.centerDistanceThreshold,
                         trackerConfig.maxMissingMs);
 
-            application::vision::VisionPipeline pipeline(inferencer, tracker, frames);
+            domain::vision::FallRuleEngine ruleEngine(rules);
+            SPDLOG_WARN("[App] 安全区域管理模块尚未接入，本次运行不启用安全躺卧过滤");
+
+            auto onFallEvent = [](domain::event::AlertEvent event)
+            {
+                SPDLOG_WARN(
+                    "[FallEvent] 已判定跌倒：Track={}，timestamp={}，center=({}, {})；"
+                    "当前仅记录日志，事件尚未入库或上传",
+                    event.personTrackId, event.timestamp,
+                    event.triggerBoxX, event.triggerBoxY);
+            };
+
+            application::vision::VisionPipeline pipeline(inferencer, tracker, ruleEngine, frames, {}, {}, std::move(onFallEvent));
 
             infrastructure::camera::CameraOptions cameraOptions;
             cameraOptions.deviceId = config.getInt("vision.camera_device_id", 0);

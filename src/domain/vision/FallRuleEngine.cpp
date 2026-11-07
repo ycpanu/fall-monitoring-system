@@ -1,0 +1,441 @@
+#include "fall_monitoring/domain/vision/FallRuleEngine.hpp"
+#include <spdlog/spdlog.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <utility>
+
+namespace fall_monitoring::domain::vision
+{
+        // 规则计算仍在同一推理线程内执行，不在 Domain 内启动任务线程。
+        FallRuleEngine::FallRuleEngine(FallRuleConfig config, const ISafeZoneQuery* safeZoneQuery) : config_(std::move(config)), safeZoneQuery_(safeZoneQuery)
+        {
+            SPDLOG_INFO("跌倒规则引擎初始化：angle={}°, recovery={}°, " "hipVelocity={:.2f} body/s, centerVelocity={:.2f} body/s, " "suspect={}ms, staticLie={}ms", config_.fallAngleThreshold, config_.recoveryAngleThreshold, config_.normalizedVelocityThreshold, config_.normalizedCenterVelocityThreshold, config_.suspectConfirmMs, config_.staticLieConfirmMs);
+        }
+
+        void FallRuleEngine::resetPersonToNormal(PersonState& personState)
+        {
+            personState.state = FallState::NORMAL;
+
+            personState.lieTimerActive = false;
+
+            personState.fastDropDetected = false;
+        }
+
+        void FallRuleEngine::removeExpiredPersonStates(std::chrono::steady_clock::time_point now)
+        {
+            /*
+            * PersonTracker 当前短暂保留 Track 约 1.5 秒。
+            *
+            * FallRuleEngine 再稍微多保留一点时间，
+            * 避免短暂遮挡直接丢失跌倒状态。
+            */
+            constexpr int STATE_RETENTION_MS = 2500;
+
+            for (auto it = personStates_.begin(); it != personStates_.end();)
+            {
+                const auto missingMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.lastSeenTime).count();
+
+                if (missingMs > STATE_RETENTION_MS)
+                {
+                    SPDLOG_DEBUG("[FallRule] Track {} 状态超时清除",it->first);
+
+                    it =personStates_.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        }
+
+        std::vector<event::AlertEvent> FallRuleEngine::processFrame(const std::vector<TrackedPerson>& trackedPersons, int frameWidth, int frameHeight)
+        {
+            const auto now = std::chrono::steady_clock::now();
+
+            // 清理已经长时间消失的人
+            removeExpiredPersonStates(now);
+
+            std::vector<event::AlertEvent> events;
+
+            /*
+            * 每个人分别进入自己的跌倒状态机。
+            */
+            for (const auto& person : trackedPersons)
+            {
+                /*
+                * 如果该 Track 第一次出现，
+                * unordered_map 会自动创建一份新的 PersonState。
+                */
+                auto& personState = personStates_[person.trackId];
+
+                personState.lastSeenTime = now;
+
+                event::AlertEvent event;
+
+                if (processPerson(person,frameWidth,frameHeight,personState,event))
+                {
+                    events.push_back(std::move(event));
+                }
+            }
+
+            return events;
+        }
+
+        bool FallRuleEngine::processPerson(const TrackedPerson& person, int frameWidth,int frameHeight, PersonState& personState, event::AlertEvent& outEvent)
+        {
+            outEvent = event::AlertEvent{};
+            const auto& target = person.detection;
+            const int trackId = person.trackId;
+
+            constexpr int L_SHOULDER = 5;
+            constexpr int R_SHOULDER = 6;
+            constexpr int L_HIP = 11;
+            constexpr int R_HIP = 12;
+            constexpr int L_KNEE = 13;
+            constexpr int R_KNEE = 14;
+            constexpr int L_ANKLE = 15;
+            constexpr int R_ANKLE = 16;
+
+            const auto now = std::chrono::steady_clock::now();
+
+            // =====================================================
+            // 关键点检查
+            // =====================================================
+            if (target.keypoints.size() < 17)
+            {
+                /*
+                * 这里不能 reset。
+                *
+                * 某一帧关键点识别失败，
+                * 保留这个人的历史状态。
+                */
+                return false;
+            }
+
+            const auto& kp = target.keypoints;
+
+            const bool leftShoulderValid = kp[L_SHOULDER].confidence >= config_.kptConfThreshold;
+
+            const bool rightShoulderValid = kp[R_SHOULDER].confidence >= config_.kptConfThreshold;
+
+            const bool leftHipValid = kp[L_HIP].confidence >= config_.kptConfThreshold;
+
+            const bool rightHipValid = kp[R_HIP].confidence >= config_.kptConfThreshold;
+
+            if ((!leftShoulderValid && !rightShoulderValid) || (!leftHipValid && !rightHipValid))
+            {
+                return false;
+            }
+
+            // =====================================================
+            // 肩部中点
+            // =====================================================
+            float shoulderX = 0.0f;
+            float shoulderY = 0.0f;
+            int shoulderCount = 0;
+
+            if (leftShoulderValid)
+            {
+                shoulderX += kp[L_SHOULDER].x;
+                shoulderY += kp[L_SHOULDER].y;
+                ++shoulderCount;
+            }
+
+            if (rightShoulderValid)
+            {
+                shoulderX += kp[R_SHOULDER].x;
+                shoulderY += kp[R_SHOULDER].y;
+                ++shoulderCount;
+            }
+
+            shoulderX /= static_cast<float>(shoulderCount);
+            shoulderY /= static_cast<float>(shoulderCount);
+
+            // =====================================================
+            // 髋部中点
+            // =====================================================
+            float hipX = 0.0f;
+            float hipY = 0.0f;
+            int hipCount = 0;
+
+            if (leftHipValid)
+            {
+                hipX += kp[L_HIP].x;
+                hipY += kp[L_HIP].y;
+                ++hipCount;
+            }
+
+            if (rightHipValid)
+            {
+                hipX += kp[R_HIP].x;
+                hipY += kp[R_HIP].y;
+                ++hipCount;
+            }
+
+            hipX /= static_cast<float>(hipCount);
+            hipY /= static_cast<float>(hipCount);
+
+            // =====================================================
+            // 身体倾角
+            // =====================================================
+            const float dx = hipX - shoulderX;
+            const float dy = hipY - shoulderY;
+            const float angle = std::atan2(std::abs(dx),std::abs(dy)) * 180.0f / 3.14159265358979323846f;
+
+            // =====================================================
+            // Bounding Box
+            // =====================================================
+            const float bodyHeight = static_cast<float>(std::max(target.height, 1));
+
+            // 弯腰时躯干可能接近水平，但髋、膝、踝仍沿同一条直立的腿排列。
+            // 仅在关键点可靠且两个腿段都明显向下时，才认为该腿仍在支撑身体。
+            const auto isSupportingLeg = [&](int hip, int knee, int ankle)
+            {
+                if (kp[hip].confidence < config_.kptConfThreshold || kp[knee].confidence < config_.kptConfThreshold || kp[ankle].confidence < config_.kptConfThreshold)
+                {
+                    return false;
+                }
+
+                const float upperY = static_cast<float>(kp[knee].y - kp[hip].y);
+                const float lowerY = static_cast<float>(kp[ankle].y - kp[knee].y);
+                const float minSegment = bodyHeight * 0.08f;
+                return upperY >= minSegment && lowerY >= minSegment && std::abs(kp[knee].x - kp[hip].x) <= upperY * 0.75f && std::abs(kp[ankle].x - kp[knee].x) <= lowerY * 0.75f;
+            };
+
+            const bool hasSupportingLeg = isSupportingLeg(L_HIP, L_KNEE, L_ANKLE) || isSupportingLeg(R_HIP, R_KNEE, R_ANKLE);
+            const float centerX = static_cast<float>(target.x) + static_cast<float>(target.width) / 2.0f;
+
+            const float centerY = static_cast<float>(target.y) + bodyHeight / 2.0f;
+
+            // =====================================================
+            // 运动速度
+            // =====================================================
+            float normalizedHipVelocity = 0.0f;
+            float normalizedCenterVelocity = 0.0f;
+
+            if (personState.hasPreviousTarget)
+            {
+                const float dt = std::chrono::duration<float>(now - personState.lastFrameTime).count();
+
+                if (dt > 0.001f && dt < 1.0f)
+                {
+                    const float referenceHeight = std::max((bodyHeight + personState.previousBodyHeight) / 2.0f,1.0f);
+                    normalizedHipVelocity =(hipY - personState.previousHipY) / referenceHeight / dt;
+
+                    normalizedCenterVelocity = (centerY - personState.previousCenterY) / referenceHeight / dt;
+                }
+            }
+
+            // =====================================================
+            // 安全区域
+            // =====================================================
+            bool inSafeLieZone = false;
+            float overlapRatio = 0.0f;
+
+            if (safeZoneQuery_ != nullptr && frameWidth > 0 && frameHeight > 0)
+            {
+                const float normalizedHipX = std::clamp(hipX / static_cast<float>(frameWidth), 0.0f, 1.0f);
+                const float normalizedHipY =std::clamp(hipY / static_cast<float>(frameHeight),0.0f,1.0f);
+                const bool hipInside = safeZoneQuery_->isPointInSafeZone(normalizedHipX,normalizedHipY);
+
+                overlapRatio = safeZoneQuery_->calculateBoxOverlapRatio(target.x,target.y,target.width,target.height,frameWidth,frameHeight);
+
+                inSafeLieZone = hipInside &&overlapRatio >=config_.safeZoneOverlapThreshold;
+            }
+
+            // =====================================================
+            // 基础特征
+            // =====================================================
+            const bool isLying = angle >= config_.fallAngleThreshold;
+            const bool isRecovered = angle <= config_.recoveryAngleThreshold;
+            const bool hipFastDrop = normalizedHipVelocity >= config_.normalizedVelocityThreshold;
+            const bool centerFastDrop = normalizedCenterVelocity >= config_.normalizedCenterVelocityThreshold;
+            const bool fastDrop = hipFastDrop || centerFastDrop;
+
+            // 框中心会随着肩膀弯下而下降；若髋部没有快速下降且腿仍直立，
+            // 这不是足够的跌倒证据。失去腿部关键点时不做这个抑制。
+            const bool supportedBend = angle > config_.recoveryAngleThreshold && hasSupportingLeg && !hipFastDrop;
+            if (supportedBend && centerFastDrop)
+            {
+                SPDLOG_DEBUG("[FallRule][Track {}] 中心下降但髋部未快速下降、腿部仍直立，按弯腰抑制 angle={:.1f}, hipV={:.2f}, centerV={:.2f}", trackId, angle, normalizedHipVelocity, normalizedCenterVelocity);
+            }
+
+            // =====================================================
+            // 快速下降时间窗口
+            // =====================================================
+            if (fastDrop && !supportedBend)
+            {
+                personState.fastDropDetected = true;
+                personState.lastFastDropTime = now;
+            }
+
+            if (personState.fastDropDetected)
+            {
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now -personState.lastFastDropTime).count();
+                if (elapsed > config_.fallEventWindowMs)
+                {
+                    personState.fastDropDetected = false;
+                }
+            }
+
+            // =====================================================
+            // 静态躺卧计时
+            // =====================================================
+            if (isLying && !supportedBend && !inSafeLieZone)
+            {
+                if (!personState.lieTimerActive)
+                {
+                    personState.lieTimerActive = true;
+                    personState.lieStartTime = now;
+                }
+            }
+            else
+            {
+                personState.lieTimerActive = false;
+            }
+
+            bool confirmedThisFrame = false;
+
+            if (supportedBend)
+            {
+                personState.fastDropDetected = false;
+                personState.lieTimerActive = false;
+                if (personState.state == FallState::SUSPECTED_FALL)
+                {
+                    SPDLOG_INFO("[FallRule][Track {}] 腿部保持直立且髋部未快速下降，疑似跌倒取消", trackId);
+                    resetPersonToNormal(personState);
+                }
+            }
+
+            // =====================================================
+            // 每个人自己的状态机
+            // =====================================================
+            switch (personState.state)
+            {
+                case FallState::NORMAL:
+                {
+                    if (inSafeLieZone && isLying)
+                    {
+                        personState.fastDropDetected = false;
+                        personState.lieTimerActive = false;
+
+                        SPDLOG_DEBUG("[FallRule][Track {}] 安全区域内躺卧，抑制跌倒判定 angle={:.1f}, overlap={:.2f}", trackId, angle, overlapRatio);
+
+                        break;
+                    }
+
+                    if (!supportedBend && !inSafeLieZone && personState.fastDropDetected && angle > config_.recoveryAngleThreshold)
+                    {
+                        personState.state = FallState::SUSPECTED_FALL;
+                        personState.suspectedStartTime = now;
+
+                        SPDLOG_INFO("[FallRule][Track {}] NORMAL -> SUSPECTED_FALL angle={:.1f}, hipV={:.2f}, centerV={:.2f}", trackId, angle, normalizedHipVelocity, normalizedCenterVelocity);
+                    }
+                    else if (isLying && !supportedBend && !inSafeLieZone && personState.lieTimerActive)
+                    {
+                        const auto lieDuration = std::chrono::duration_cast<std::chrono::milliseconds>(now - personState.lieStartTime).count();
+
+                        if (lieDuration >= config_.staticLieConfirmMs)
+                        {
+                            personState.state = FallState::CONFIRMED_FALL;
+                            confirmedThisFrame = true;
+
+                            SPDLOG_WARN("[FallRule][Track {}] 静态异常躺卧确认", trackId);
+                        }
+                    }
+
+                    break;
+                }
+
+                case FallState::SUSPECTED_FALL:
+                {
+                    if (inSafeLieZone && isLying)
+                    {
+                        SPDLOG_INFO("[FallRule][Track {}] 疑似跌倒最终进入安全区域，SUSPECTED_FALL -> NORMAL overlap={:.2f}", trackId, overlapRatio);
+
+                        resetPersonToNormal(personState);
+                        break;
+                    }
+
+                    if (isRecovered)
+                    {
+                        SPDLOG_INFO("[FallRule][Track {}] SUSPECTED_FALL -> NORMAL", trackId);
+
+                        resetPersonToNormal(personState);
+                        break;
+                    }
+
+                    const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - personState.suspectedStartTime).count();
+
+                    if (isLying && !supportedBend && !inSafeLieZone && duration >= config_.suspectConfirmMs)
+                    {
+                        personState.state = FallState::CONFIRMED_FALL;
+                        confirmedThisFrame = true;
+                    }
+                    else if (duration > config_.fallEventWindowMs)
+                    {
+                        resetPersonToNormal(personState);
+                    }
+
+                    break;
+                }
+
+                case FallState::CONFIRMED_FALL:
+                {
+                    confirmedThisFrame = true;
+
+                    break;
+                }
+
+                case FallState::ALARMED:
+                {
+                    if (isRecovered)
+                    {
+                        SPDLOG_INFO("[FallRule][Track {}] " "ALARMED -> NORMAL", trackId);
+
+                        resetPersonToNormal(personState);
+                    }
+
+                    break;
+                }
+            }
+
+            // =====================================================
+            // 生成该人的报警
+            // =====================================================
+            if (confirmedThisFrame)
+            {
+                outEvent.eventType = event::EventType::FALL;
+                outEvent.source = {event::EventSource::VISION};
+                outEvent.status = event::EventStatus::NEW;
+                outEvent.personTrackId = trackId;
+
+                outEvent.timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+
+                outEvent.triggerBoxX = static_cast<int>(centerX);
+
+                outEvent.triggerBoxY = static_cast<int>(centerY);
+
+                personState.state = FallState::ALARMED;
+
+                SPDLOG_WARN("[FallRule][Track {}] " "确认跌倒，进入 ALARMED", trackId);
+            }
+
+            // =====================================================
+            // 保存该人的当前数据
+            // =====================================================
+            personState.previousHipY = hipY;
+
+            personState.previousCenterY = centerY;
+
+            personState.previousBodyHeight = bodyHeight;
+
+            personState.lastFrameTime = now;
+
+            personState.hasPreviousTarget = true;
+
+            return confirmedThisFrame;
+        }
+}

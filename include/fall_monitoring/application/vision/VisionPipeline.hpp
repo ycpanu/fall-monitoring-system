@@ -2,10 +2,10 @@
 
 #include "fall_monitoring/application/ports/IPoseInferencer.hpp"
 #include "fall_monitoring/concurrency/LatestFrameQueue.hpp"
+#include "fall_monitoring/domain/event/AlertEvent.hpp"
+#include "fall_monitoring/domain/vision/FallRuleEngine.hpp"
 #include "fall_monitoring/domain/vision/PersonTracker.hpp"
 
-#include <chrono>
-#include <cstdint>
 #include <functional>
 #include <vector>
 #include <opencv2/core/mat.hpp>
@@ -21,15 +21,17 @@ namespace fall_monitoring::application::vision
     {
     public:
         using FrameQueue = concurrency::LatestFrameQueue<cv::Mat>;
-        using DetectionHandler = std::function<void(const cv::Mat&, const std::vector<domain::vision::DetectResult>&)>
+        using DetectionHandler = std::function<void(const cv::Mat&, const std::vector<domain::vision::DetectResult>&)>;
         using TrackingHandler = std::function<void(const cv::Mat&, const std::vector<domain::vision::TrackedPerson>&)>;
+        using FallEventHandler = std::function<void(domain::event::AlertEvent)>;
 
         VisionPipeline(application::ports::IPoseInferencer& inferencer,
-            domain::vision::PersonTracker& tracker, 
-            FrameQueue& frame, 
-            DetectionHandler onDetection = {},
-            TrackingHandler onTracked ={}
-        );
+                       domain::vision::PersonTracker& tracker,
+                       domain::vision::FallRuleEngine& ruleEngine,
+                       FrameQueue& frames,
+                       DetectionHandler onDetection = {},
+                       TrackingHandler onTracked = {},
+                       FallEventHandler onFallEvent = {});
 
         /**
          * @brief 在调用者线程持续消费帧，直到停止请求或队列关闭。
@@ -40,8 +42,10 @@ namespace fall_monitoring::application::vision
     private:
         application::ports::IPoseInferencer& inferencer_;
         domain::vision::PersonTracker& tracker_;
+        domain::vision::FallRuleEngine& ruleEngine_;
         FrameQueue& frames_;
         DetectionHandler onDetection_;
         TrackingHandler onTracked_;
+        FallEventHandler onFallEvent_;
     };
 }

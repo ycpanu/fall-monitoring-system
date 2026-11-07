@@ -476,8 +476,7 @@ namespace fall_monitoring::infrastructure::rknn
         return impl_->init();
     }
 
-    bool RknnPoseInferencer::infer(const cv::Mat& frame,
-                                  std::vector<domain::vision::DetectResult>& results)
+    bool RknnPoseInferencer::infer(const cv::Mat& frame, std::vector<domain::vision::DetectResult>& results)
     {
         return impl_->detect(frame, results);
     }

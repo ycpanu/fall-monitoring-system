@@ -11,14 +11,18 @@ namespace fall_monitoring::application::vision
 {
     VisionPipeline::VisionPipeline(application::ports::IPoseInferencer& inferencer,
                                    domain::vision::PersonTracker& tracker,
+                                   domain::vision::FallRuleEngine& ruleEngine,
                                    FrameQueue& frames,
                                    DetectionHandler onDetection,
-                                   TrackingHandler onTracked)
+                                   TrackingHandler onTracked,
+                                   FallEventHandler onFallEvent)
         : inferencer_(inferencer),
           tracker_(tracker),
+          ruleEngine_(ruleEngine),
           frames_(frames),
           onDetection_(std::move(onDetection)),
-          onTracked_(std::move(onTracked))
+          onTracked_(std::move(onTracked)),
+          onFallEvent_(std::move(onFallEvent))
     {
     }
 
@@ -30,54 +34,58 @@ namespace fall_monitoring::application::vision
         std::uint64_t successCount = 0;
         std::uint64_t failedCount = 0;
         std::uint64_t personCount = 0;
+        std::uint64_t fallCount = 0;
         std::size_t lastDroppedCount = frames_.droppedCount();
-        SPDLOG_INFO("[Vision] 姿态推理流水线开始");
 
-        // 仅在当前线程调用 infer；采集线程不会直接访问 RKNN 上下文。
-        while(shouldContinue())
+        SPDLOG_INFO("[Vision] 姿态推理、目标跟踪和跌倒规则流水线启动");
+        // 主线程串行操作 RKNN、Tracker 和 RuleEngine，避免共享状态跨线程读写。
+        while (shouldContinue())
         {
             cv::Mat frame;
             if (!frames_.waitPopFor(frame, std::chrono::milliseconds(500)))
             {
-                if (frame_.isClosed())
+                if (frames_.isClosed())
                 {
-                    SPDLOG_WARN("[Vision] 视频帧队列已关闭，停止推理");
+                    SPDLOG_INFO("[Vision] 帧队列已关闭，结束视觉处理");
                     break;
                 }
                 continue;
             }
 
-            ++framesCount;
+            ++frameCount;
             std::vector<domain::vision::DetectResult> detections;
-            if (inferencer_.infer(frame, detections))
+            const bool inferenceOk = inferencer_.infer(frame, detections);
+            if (inferenceOk)
             {
                 ++successCount;
                 personCount += detections.size();
-                if (onDetection_)
-                {
-                    // 只透传检测结果，跟踪/跌倒规则不放入基础设施适配器。
-                    onDetection_(frame, detections);
-                }
             }
             else
             {
                 ++failedCount;
-                // RKNN 适配器负责输出具体失败码；流水线只记录累计失败数。
             }
 
-            // 没处理一帧都更新跟踪器；空结果只触发过期清理。
             const auto tracked = tracker_.update(detections);
             if (inferenceOk)
             {
-                // 保留上一功能的原始检测回调，不破坏原有调用者接口。
-                if (onDetection_)
+                if (onDetection_) onDetection_(frame, detections);
+                if (onTracked_) onTracked_(frame, tracked);
+
+                // 规则状态机仅在推理成功的帧推进。
+                auto events = ruleEngine_.processFrame(tracked, frame.cols, frame.rows);
+                fallCount += events.size();
+                for (auto& event : events)
                 {
-                    onDetection_(frame, detections);
-                }
-                // 规则引擎后续接入此回调，不依赖 RKNN 的具体实现。
-                if (onTracked_)
-                {
-                    onTracked_(frame, tracked);
+                    if (onFallEvent_)
+                    {
+                        // 报警路由必须立即移交后续事件服务，不能在这里做网络/磁盘 I/O。
+                        onFallEvent_(std::move(event));
+                    }
+                    else
+                    {
+                        SPDLOG_ERROR("[Vision] 检测到跌倒但未配置事件处理器：Track={}，事件未保存",
+                                     event.personTrackId);
+                    }
                 }
             }
 
@@ -87,16 +95,16 @@ namespace fall_monitoring::application::vision
             {
                 const auto dropped = frames_.droppedCount();
                 SPDLOG_INFO(
-                    "[Vision] {:.1f}s: 处理={}帧, 推理成功={}, 失败={}, 检出人体={}, "
-                    "FPS={:.2f}, 活跃Track={}, 丢旧帧={}",
-                    seconds, frameCount, successCount, failedCount, personCount,
+                    "[Vision] {:.1f}s: 处理={}帧，成功={}，失败={}，人体={}，跌倒事件={}，"
+                    "FPS={:.2f}，活跃Track={}，丢旧帧={}",
+                    seconds, frameCount, successCount, failedCount, personCount, fallCount,
                     static_cast<double>(frameCount) / seconds,
                     tracker_.activeTrackCount(), dropped - lastDroppedCount);
                 lastReport = now;
-                frameCount = successCount = failedCount = personCount = 0;
+                frameCount = successCount = failedCount = personCount = fallCount = 0;
                 lastDroppedCount = dropped;
             }
         }
-        SPDLOG_INFO("[Vision] 姿态推理流水线已退出");
+        SPDLOG_INFO("[Vision] 视觉流水线已退出");
     }
 }
