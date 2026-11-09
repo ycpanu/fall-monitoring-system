@@ -126,7 +126,7 @@ namespace fall_monitoring::concurrency
         /**
          * @brief 唤醒阻塞生产者与消费者
          */
-        void clase() noexcept
+        void close() noexcept
         {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
