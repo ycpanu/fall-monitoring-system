@@ -8,7 +8,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -32,7 +34,8 @@ namespace fall_monitoring::application::event
     class EventService final 
     {
     public:
-        using EventHandler = std::function<void(domain::event::AlertEvent)>;
+        // 返回 true 表示已成功提交持久化；false 表示需要保留并重试。
+        using EventHandler = std::function<bool(const domain::event::AlertEvent&)>;
 
         EventService(EventServiceOptions options, EventHandler onPreparedEvent);
         ~EventService();
@@ -65,5 +68,8 @@ namespace fall_monitoring::application::event
         std::thread worker_;
         std::atomic<bool> accepting_{false};
         std::atomic<bool> startedOnce_{false};
+        std::atomic<bool> stopping_{false};
+        std::mutex retryMutex_;
+        std::condition_variable retryCv_;
     };
 }
