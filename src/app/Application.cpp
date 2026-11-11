@@ -87,18 +87,14 @@ namespace fall_monitoring::app
 
             domain::vision::PersonTrackerConfig trackerConfig;
             domain::vision::PersonTracker tracker(trackerConfig);
-            SPDLOG_INFO("[Tracker] 初始化: IoU={:.2f}, 中心距离={:.2f}, 保留={}ms",
-                        trackerConfig.iouThreshold,
-                        trackerConfig.centerDistanceThreshold,
-                        trackerConfig.maxMissingMs);
+            SPDLOG_INFO("[Tracker] 初始化: IoU={:.2f}, 中心距离={:.2f}, 保留={}ms", trackerConfig.iouThreshold, trackerConfig.centerDistanceThreshold, trackerConfig.maxMissingMs);
 
             domain::vision::FallRuleEngine ruleEngine(rules);
             SPDLOG_WARN("[App] 安全区域管理模块尚未接入，本次运行不启用安全躺卧过滤");
 
             auto onFallEvent = [](domain::event::AlertEvent event)
             {
-                SPDLOG_WARN(
-                    "[FallEvent] 已判定跌倒：Track={}，timestamp={}，center=({}, {})；"
+                SPDLOG_WARN("[FallEvent] 已判定跌倒：Track={}，timestamp={}，center=({}, {})；"
                     "当前仅记录日志，事件尚未入库或上传",
                     event.personTrackId, event.timestamp,
                     event.triggerBoxX, event.triggerBoxY);
