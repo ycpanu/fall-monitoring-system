@@ -1,0 +1,21 @@
+# 示例：安装前根据板端路径修改 User、WorkingDirectory 和 ExecStart。
+# Type=notify / WatchdogSec 需要 RuntimeSupervisor 主循环持续报告健康帧。
+[Unit]
+Description=Fall Monitoring Edge Gateway
+After=network.target
+Wants=network.target
+
+[Service]
+Type=notify
+User=orangepi
+WorkingDirectory=/home/orangepi/projects/fall-monitoring-system
+ExecStart=/home/orangepi/projects/fall-monitoring-system/build/fall_monitoring_gateway
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=90
+TimeoutStopSec=30
+WatchdogSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
