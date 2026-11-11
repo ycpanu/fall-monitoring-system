@@ -12,13 +12,14 @@ namespace fall_monitoring::infrastructure::camera
 {
     using namespace std::chrono_literals;
 
-    CameraCapture::CameraCapture(CameraOptions options, FrameQueue& output, FrameObserver onFrame) : options_(std::move(options)), output_(output), onFrame_(std::move(onFrame))
+    CameraCapture::CameraCapture(CameraOptions options, FrameQueue& output, FrameObserver onFrame)
+        : options_(std::move(options)), output_(output), onFrame_(std::move(onFrame))
     {
     }
 
     CameraCapture::~CameraCapture()
     {
-        // RAII 即使上层遗漏 stop()，也要等待工作线程结束
+        // RAII：即使上层遗漏 stop()，也要等待工作线程结束。
         stop();
     }
 
@@ -26,11 +27,10 @@ namespace fall_monitoring::infrastructure::camera
     {
         if (running_.load())
         {
-            SPDLOG_INFO("[Camera] 重复启动请求，已忽略");
+            SPDLOG_WARN("[Camera] 重复启动请求，已忽略");
             return true;
         }
-
-        // 线程可能已因读取错误退出，但std::thread 仍需要 join()
+        // 线程可能已因读取错误退出，但 std::thread 仍需要 join()。
         if (worker_.joinable())
         {
             SPDLOG_ERROR("[Camera] 上一次采集线程尚未回收，请先调用 stop()");
@@ -47,8 +47,8 @@ namespace fall_monitoring::infrastructure::camera
             return false;
         }
 
-        const bool fileMode = !options_videoPath.empty();
-        try 
+        const bool fileMode = !options_.videoPath.empty();
+        try
         {
             if (fileMode)
             {
@@ -62,7 +62,7 @@ namespace fall_monitoring::infrastructure::camera
             }
             else
             {
-                // 强制使用 V4L2，并尝试使用 MJPEG 格式。
+                // 与旧版行为一致：强制使用 V4L2，并尝试使用 MJPEG 格式。
                 if (!capture_.open(options_.deviceId, cv::CAP_V4L2))
                 {
                     SPDLOG_ERROR("[Camera] 无法打开摄像头：/dev/video{}", options_.deviceId);
@@ -82,9 +82,9 @@ namespace fall_monitoring::infrastructure::camera
             worker_ = std::thread(&CameraCapture::captureLoop, this);
             return true;
         }
-        catch(const std::exception& e)
+        catch (const std::exception& e)
         {
-            // 包含 OpenCV 异常及 std::thread 创建失败
+            // 包含 OpenCV 异常及 std::thread 创建失败；不留下占用中的设备。
             SPDLOG_ERROR("[Camera] 启动失败：{}", e.what());
         }
         catch (...)
@@ -98,7 +98,7 @@ namespace fall_monitoring::infrastructure::camera
 
     void CameraCapture::stop() noexcept
     {
-        // 不管 running_ 当前是否为 false，都必须回收 joinable 的线程
+        // 不管 running_ 当前是否为 false，都必须回收 joinable 的线程。
         const bool wasRunning = running_.exchange(false);
         if (wasRunning || worker_.joinable())
         {
@@ -106,7 +106,7 @@ namespace fall_monitoring::infrastructure::camera
         }
         if (worker_.joinable())
         {
-            worker_.join(); //必须先结束读取线程，才能安全 release VideoCapture
+            worker_.join(); // 必须先结束读取线程，才能安全 release VideoCapture。
         }
         if (capture_.isOpened())
         {
@@ -120,22 +120,22 @@ namespace fall_monitoring::infrastructure::camera
         try
         {
             const bool fileMode = !options_.videoPath.empty();
-            auto interal = std::chrono::milliseconds(options_.cameraFrameIntervalMs)
+            auto interval = std::chrono::milliseconds(options_.cameraFrameIntervalMs);
             if (fileMode)
             {
                 const double fps = capture_.get(cv::CAP_PROP_FPS);
                 if (std::isfinite(fps) && fps > 0.0)
                 {
-                    interal = std::chrono::milliseconds(static_cast<int>(std::clamp(1000.0 / fps, 1.0, 60000.0)));
+                    interval = std::chrono::milliseconds(static_cast<int>(std::clamp(1000.0 / fps, 1.0, 60000.0)));
                 }
             }
-            SPDLOG_INFO("[Camera] 采集线程开始：source={}, interal={}ms", fileMode ? options_.videoPath : "V4L2", interal.count());
+            SPDLOG_INFO("[Camera] 采集线程开始：source={}, interval={}ms", fileMode ? options_.videoPath : "V4L2", interval.count());
 
             auto lastEmptyWarning = std::chrono::steady_clock::time_point{};
             while (running_.load())
             {
-                // 每次创建 Mat，保证进入队列后的数据不被下一次读取复用写坏
-                // cv::Mat 的引用计数允许轻量传递；后续消费者不得原地修改共享帧
+                // 每次新建 Mat，保证进入队列后的数据不被下一次读取复用写坏。
+                // cv::Mat 的引用计数允许轻量传递；后续消费者不得原地修改共享帧。
                 cv::Mat frame;
                 if (!capture_.read(frame) || frame.empty())
                 {
@@ -151,9 +151,9 @@ namespace fall_monitoring::infrastructure::camera
                     }
                     else
                     {
-                        // 节流 WARN，防止摄像头断开时每秒刷屏
+                        // 节流 WARN，防止摄像头断开时每秒刷屏。
                         const auto now = std::chrono::steady_clock::now();
-                        if (!lastEmptyWarning == std::chrono::steady_clock::time_point{} || now - lastEmptyWarning >= 5s)
+                        if (lastEmptyWarning == std::chrono::steady_clock::time_point{} || now - lastEmptyWarning >= 5s)
                         {
                             SPDLOG_WARN("[Camera] 摄像头读取失败或空帧，将继续重试");
                             lastEmptyWarning = now;
@@ -163,7 +163,7 @@ namespace fall_monitoring::infrastructure::camera
                     continue;
                 }
 
-                // 观察者只观察这一帧。录像/推流模块应在自己的队列内异步处理
+                // 观察者只观察这一帧。录像/推流模块应在自己的队列内异步处理。
                 if (onFrame_)
                 {
                     try
@@ -185,7 +185,8 @@ namespace fall_monitoring::infrastructure::camera
                     SPDLOG_WARN("[Camera] 输出队列已关闭，采集线程退出");
                     break;
                 }
-                ++capturedCount;
+                ++capturedCount_;
+                // 保留原版本的采集限速行为，避免本地文件按 CPU 速度回放。
                 std::this_thread::sleep_for(interval);
             }
         }
@@ -200,4 +201,4 @@ namespace fall_monitoring::infrastructure::camera
         running_ = false;
         SPDLOG_INFO("[Camera] 采集线程退出");
     }
-}
+} // namespace fall_monitoring::infrastructure::camera

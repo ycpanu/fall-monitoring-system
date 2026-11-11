@@ -32,7 +32,7 @@ namespace fall_monitoring::domain::vision
     /**
      * @brief 每位人体独立的跌倒状态机；只消费姿态跟踪结果。
      *
-     * 角度+髋/框中心速度+快速下降窗口+持续躺卧兜底；
+     * 与旧版一致：角度+髋/框中心速度+快速下降窗口+持续躺卧兜底；
      * 支撑腿抑制弯腰误报，安全躺卧区域在提供查询实现后抑制报警；
      * ALARMED 状态下不重复报警，恢复直立后才允许下一次事件。
      *
@@ -43,9 +43,7 @@ namespace fall_monitoring::domain::vision
     public:
         explicit FallRuleEngine(FallRuleConfig config = {}, const ISafeZoneQuery* safeZoneQuery = nullptr);
 
-        [[nodiscard]] std::vector<event::AlertEvent> processFrame(
-            const std::vector<TrackedPerson>& trackedPersons,
-            int frameWidth, int frameHeight);
+        [[nodiscard]] std::vector<event::AlertEvent> processFrame(const std::vector<TrackedPerson>& trackedPersons, int frameWidth, int frameHeight);
 
     private:
         struct PersonState

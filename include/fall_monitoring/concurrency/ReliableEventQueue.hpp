@@ -8,38 +8,39 @@
 #include <stdexcept>
 #include <utility>
 
-namespace fall_monitoring::concurrency
-{
+namespace fall_monitoring::concurrency {
+
     /**
-     * @brief 不静默丢事件的有界队列，采用生产者背压机制
+     * @brief 不静默丢事件的有界队列，采用生产者背压机制。
+     *
+     * 适用场景：视觉/语音触发 -> 事件处理服务。
+     * 队满时，push() 等待消费者释放容量；tryPush()/pushFor() 可能返回 false。
+     * 返回 false 时不移动传入对象，调用者必须记录异常并采取可靠回退措施。
      */
     template <typename T>
-    class ReliableEventQueue final 
-    {
+    class ReliableEventQueue final {
     public:
-        explicit ReliableEventQueue(std::size_t capacity) : capacity_(capacity)
-        {
-            if (capacity == 0)
-            {
-                throw std::invalid_argument("ReliableEventQueue capacity 必须大于 0");
+        explicit ReliableEventQueue(std::size_t capacity) : capacity_(capacity) {
+            if (capacity == 0) {
+                throw std::invalid_argument("ReliableEventQueue capacity must be > 0");
             }
-
-            ReliableEventQueue(const ReliableEventQueue&) = delete;
-            ReliableEventQueue& operator=(const ReliableEventQueue&) = delete;
         }
 
+        ReliableEventQueue(const ReliableEventQueue&) = delete;
+        ReliableEventQueue& operator=(const ReliableEventQueue&) = delete;
+
         /**
-         * @brief 队列满时阻塞，知道可写入或队列关闭
-         * @note 若不允许长时间阻塞视觉线程，使用 pushFor() 并处理返回 false
+         * @brief 队列满时阻塞，直到可写入或队列关闭。
+         * @note 若不允许长时间阻塞视觉线程，使用 pushFor() 并处理返回 false。
          */
-        [[nodiscard]] bool push(T& value)
-        {
+        [[nodiscard]] bool push(T&& value) {
             std::unique_lock<std::mutex> lock(mutex_);
-            notFull_wait(lock, [this]{
+            notFull_.wait(lock, [this] {
                 return closed_ || queue_.size() < capacity_;
             });
-
-            if (closed_) return false;
+            if (closed_) {
+                return false;
+            }
             queue_.emplace_back(std::move(value));
             lock.unlock();
             notEmpty_.notify_one();
@@ -47,15 +48,13 @@ namespace fall_monitoring::concurrency
         }
 
         /**
-         * @brief 非阻塞尝试写入
-         * @return 满队列/已关闭时返回 false，传入对象保持未被移动
+         * @brief 非阻塞尝试写入。
+         * @return 满队列/已关闭时返回 false，传入对象保持未被移动。
          */
-        [[nodiscard]] bool tryPush(T& value)
-        {
+        [[nodiscard]] bool tryPush(T&& value) {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                if (closed_ || queue_.size() >= capacity_)
-                {
+                if (closed_ || queue_.size() >= capacity_) {
                     return false;
                 }
                 queue_.emplace_back(std::move(value));
@@ -65,15 +64,17 @@ namespace fall_monitoring::concurrency
         }
 
         /**
-         * @brief 最多等待 timeout 时间插入事件
+         * @brief 最多等待 timeout 时间插入事件。
+         * 失败时原对象仍由调用方持有，必须明确处理而不能忽略。
          */
-        [[nodiscard]] bool pushFor(T&& value, std::chrono::milliseconds timeout)
-        {
+        [[nodiscard]] bool pushFor(T&& value, std::chrono::milliseconds timeout) {
             std::unique_lock<std::mutex> lock(mutex_);
-            if (!notFull_.wait_for(lock, timeout, [this]{
-                return closed_ || queue_.size() < capacity_;
-            }))
-            {
+            if (!notFull_.wait_for(lock, timeout, [this] {
+                    return closed_ || queue_.size() < capacity_;
+                })) {
+                return false;
+            }
+            if (closed_) {
                 return false;
             }
             queue_.emplace_back(std::move(value));
@@ -83,18 +84,14 @@ namespace fall_monitoring::concurrency
         }
 
         /** @brief 关闭后继续取出剩余事件；关闭且为空才返回 false。 */
-        [[nodiscard]] bool waitPop(T& out)
-        {
+        [[nodiscard]] bool waitPop(T& out) {
             std::unique_lock<std::mutex> lock(mutex_);
-            notEmpty_.wait(lock, [this]{
+            notEmpty_.wait(lock, [this] {
                 return closed_ || !queue_.empty();
             });
-
-            if (queue_.empty())
-            {
+            if (queue_.empty()) {
                 return false;
             }
-
             out = std::move(queue_.front());
             queue_.pop_front();
             lock.unlock();
@@ -102,18 +99,14 @@ namespace fall_monitoring::concurrency
             return true;
         }
 
-        [[nodiscard]] bool waitPopFor(T& out, std::chrono::milliseconds timeout)
-        {
+        [[nodiscard]] bool waitPopFor(T& out, std::chrono::milliseconds timeout) {
             std::unique_lock<std::mutex> lock(mutex_);
-            if(!notEmpty_.wait_for(lock, timeout, [this]{
-                return closed_ || !queue_.empty();
-            }))
-            {
+            if (!notEmpty_.wait_for(lock, timeout, [this] {
+                    return closed_ || !queue_.empty();
+                })) {
                 return false;
             }
-
-            if (queue_.empty())
-            {
+            if (queue_.empty()) {
                 return false;
             }
             out = std::move(queue_.front());
@@ -124,10 +117,10 @@ namespace fall_monitoring::concurrency
         }
 
         /**
-         * @brief 唤醒阻塞生产者与消费者
+         * @brief 唤醒阻塞生产者与消费者；已入队事件依然可继续消费。
+         * 调用方应先停止新事件生产，再 close()，最后 join 消费线程。
          */
-        void close() noexcept
-        {
+        void close() noexcept {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 closed_ = true;
@@ -136,14 +129,12 @@ namespace fall_monitoring::concurrency
             notFull_.notify_all();
         }
 
-        [[nodiscard]] std::size_t size() const 
-        {
+        [[nodiscard]] std::size_t size() const {
             std::lock_guard<std::mutex> lock(mutex_);
             return queue_.size();
         }
 
-        [[nodiscard]] bool isClosed() const 
-        {
+        [[nodiscard]] bool isClosed() const {
             std::lock_guard<std::mutex> lock(mutex_);
             return closed_;
         }
@@ -156,4 +147,4 @@ namespace fall_monitoring::concurrency
         std::deque<T> queue_;
         bool closed_ = false;
     };
-}
+} 

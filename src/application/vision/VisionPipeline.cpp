@@ -4,8 +4,8 @@
 
 #include <chrono>
 #include <cstdint>
-#include <vector>
 #include <utility>
+#include <vector>
 
 namespace fall_monitoring::application::vision
 {
@@ -65,13 +65,14 @@ namespace fall_monitoring::application::vision
                 ++failedCount;
             }
 
+            // 模型暂时推理失败，也使用空结果推进轨迹过期清理。
             const auto tracked = tracker_.update(detections);
             if (inferenceOk)
             {
                 if (onDetection_) onDetection_(frame, detections);
                 if (onTracked_) onTracked_(frame, tracked);
 
-                // 规则状态机仅在推理成功的帧推进。
+                // 规则状态机仅在推理成功的帧推进，与旧项目主循环一致。
                 auto events = ruleEngine_.processFrame(tracked, frame.cols, frame.rows);
                 fallCount += events.size();
                 for (auto& event : events)
@@ -83,8 +84,7 @@ namespace fall_monitoring::application::vision
                     }
                     else
                     {
-                        SPDLOG_ERROR("[Vision] 检测到跌倒但未配置事件处理器：Track={}，事件未保存",
-                                     event.personTrackId);
+                        SPDLOG_ERROR("[Vision] 检测到跌倒但未配置事件处理器：Track={}，事件未保存", event.personTrackId);
                     }
                 }
             }
@@ -107,4 +107,4 @@ namespace fall_monitoring::application::vision
         }
         SPDLOG_INFO("[Vision] 视觉流水线已退出");
     }
-}
+} // namespace fall_monitoring::application::vision

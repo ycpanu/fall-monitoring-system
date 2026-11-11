@@ -3,12 +3,10 @@
         "device_id": "OrangePi_Gateway_001",
         "deployment_area": "客厅"
     },
-    
     "system": {
         "log_file_path": "logs/gateway.log",
         "log_level": "INFO"
     },
-
     "vision": {
         "camera_device_id": 0,
         "frame_queue_size": 3,
@@ -16,43 +14,95 @@
         "video_save_fps": 30,
         "video_output_dir": "videos"
     },
-
     "model": {
         "rknn_model_path": "./models/yolov8n-pose-512-hybrid.rknn",
         "confidence_threshold": 0.5,
         "nms_threshold": 0.45
     },
-
     "rule_engine": {
         "kpt_conf_threshold": 0.3,
-
         "fall_angle_threshold": 60.0,
         "recovery_angle_threshold": 35.0,
-
         "normalized_velocity_threshold": 0.6,
         "normalized_center_velocity_threshold": 0.5,
-
         "suspect_confirm_ms": 2000,
         "static_lie_confirm_ms": 5000,
         "fall_event_window_ms": 2500,
         "safe_zone_overlap_threshold": 0.5
     },
-
     "network": {
         "mqtt_broker": "tcp://10.48.212.22:1883",
         "mqtt_client_id": "OrangePi_Gateway_001",
         "alert_topic": "fall_detection/alerts",
         "keep_alive_seconds": 20,
         "alert_queue_size": 10,
-        "api_base_url": "http://10.48.212.22:8000"
+        "api_base_url": "http://10.48.212.22:8000",
+        "alert_retry_seconds": 60,
+        "reconnect_seconds": 10,
+        "heartbeat_seconds": 10
     },
-
     "hardware": {
         "buzzer_gpio_pin": 138,
         "alarm_duration_ms": 3000
     },
-
     "storage": {
         "sqlite_db_path": "fall_detection_gateway.db"
+    },
+    "event": {
+        "fusion_window_ms": 10000,
+        "submit_timeout_ms": 50
+    },
+    "audio": {
+        "enabled": true,
+        "device": "plughw:CARD=Device,DEV=0",
+        "sample_rate": 16000,
+        "channels": 1,
+        "frames_per_chunk": 1600
+    },
+    "kws": {
+        "enabled": true,
+        "cooldown_ms": 5000,
+        "encoder_path": "models/kws/encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+        "decoder_path": "models/kws/decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+        "joiner_path": "models/kws/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+        "tokens_path": "models/kws/tokens.txt",
+        "keywords_path": "models/kws/keywords_custom.txt",
+        "sample_rate": 16000,
+        "feature_dim": 80,
+        "num_threads": 2,
+        "max_active_paths": 4,
+        "num_trailing_blanks": 1,
+        "keywords_score": 1.0,
+        "keywords_threshold": 0.25
+    },
+    "live_stream": {
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+        "bitrate_kbps": 1000,
+        "frame_queue_size": 3,
+        "ffmpeg_binary": "ffmpeg",
+        "encoder": "h264_rkmpp"
+    },
+    "video_recording": {
+        "post_frames": 90,
+        "width": 640,
+        "height": 480,
+        "bitrate_kbps": 1000,
+        "max_outstanding": 2,
+        "ffmpeg_binary": "ffmpeg",
+        "encoder": "h264_rkmpp"
+    },
+    "video_upload": {
+        "enabled": true,
+        "connect_timeout_seconds": 5,
+        "timeout_seconds": 60,
+        "retry_initial_seconds": 5,
+        "retry_max_seconds": 300,
+        "scan_seconds": 2,
+        "batch_size": 100
+    },
+    "scene": {
+        "config_path": "configs/scene_config.json"
     }
 }

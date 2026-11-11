@@ -1,5 +1,6 @@
 #pragma once
 
+#include "fall_monitoring/application/ports/ISafeZoneConfigurator.hpp"
 #include "fall_monitoring/domain/vision/ISafeZoneQuery.hpp"
 #include "fall_monitoring/domain/vision/SafeLieZone.hpp"
 
@@ -24,7 +25,7 @@ namespace fall_monitoring::infrastructure::scene
      *
      * 不持有 FallRuleEngine；由 Application 负责按生命周期注入。
      */
-    class SafeZoneManager final : public domain::vision::ISafeZoneQuery
+    class SafeZoneManager final : public domain::vision::ISafeZoneQuery, public application::ports::ISafeZoneConfigurator
     {
     public:
         SafeZoneManager() = default;
@@ -44,10 +45,10 @@ namespace fall_monitoring::infrastructure::scene
          * 先全部校验，再同目录临时文件写盘、rename，最后替换内存数据；
          * 任何校验/文件错误都不修改原有区域配置。
          */
-        [[nodiscard]] bool replaceZonesAndSave(const std::vector<domain::vision::SafeLieZone>& zones, const std::string& configPath);
+        [[nodiscard]] bool replaceZonesAndSave(const std::vector<domain::vision::SafeLieZone>& zones, const std::string& configPath) override;
 
         [[nodiscard]] std::vector<domain::vision::SafeLieZone> getZones() const;
-        [[nodiscard]] std::size_t getZoneCount() const;
+        [[nodiscard]] std::size_t getZoneCount() const override;
 
         [[nodiscard]] bool isPointInSafeZone(float normalizedX, float normalizedY) const override;
 

@@ -21,37 +21,35 @@ namespace fall_monitoring::infrastructure::audio
         using Options = application::ports::AudioCaptureOptions;
         using Handler = application::ports::IAudioCapture::SamplesHandler;
 
-        ~Impl() {stop();}
+        ~Impl() { stop(); }
 
         [[nodiscard]] bool start(const Options& options, Handler onSamples)
         {
-            if (rinning_.load() || worker_.joinable())
+            if (running_.load() || worker_.joinable())
             {
+                // worker_ 即使自然退出也必须 join，才能安全地重新启动。
                 SPDLOG_ERROR("[Audio] 上次采集线程未完全回收，请先调用 stop()");
                 return false;
             }
-
-            if (!onSamples || options.device.empty() || options.samplesRate <= 0 || options.channels != 1 || options.framesPerChunk <= 0 || static_cast<std::int64_t>(options.framesPerChunk) > static_cast<std::int64_t>(options.sampleRate) * 2)
+            if (!onSamples || options.device.empty() || options.sampleRate <= 0 || options.channels != 1 || options.framesPerChunk <= 0 || static_cast<std::int64_t>(options.framesPerChunk) > static_cast<std::int64_t>(options.sampleRate) * 2)
             {
                 SPDLOG_ERROR("[Audio] 音频采集参数非法：device={} rate={} channels={} chunk={}", options.device, options.sampleRate, options.channels, options.framesPerChunk);
                 return false;
             }
 
             const int rc = snd_pcm_open(&pcm_, options.device.c_str(), SND_PCM_STREAM_CAPTURE, SND_PCM_NONBLOCK);
-
             if (rc < 0)
             {
                 pcm_ = nullptr;
-                SPDLOG_ERROR("[Audion] 无法打开麦克风 {}:{}", options.device, snd_strerror(rc));
+                SPDLOG_ERROR("[Audio] 无法打开麦克风 {}：{}", options.device, snd_strerror(rc));
                 return false;
             }
 
-            // S16_LE、interleaved、允许 plug 重采样、100ms 缓冲延迟。
+            // 旧项目保持不变：S16_LE、interleaved、允许 plug 重采样、100ms 缓冲延迟。
             const int setup = snd_pcm_set_params(pcm_, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, static_cast<unsigned int>(options.channels), static_cast<unsigned int>(options.sampleRate), 1, 100000);
-
             if (setup < 0)
             {
-                SPDLOG_ERROR("[Audion] 配置 PCM 设备失败：{}", snd_strerror(setup));
+                SPDLOG_ERROR("[Audio] 配置 PCM 设备失败：{}", snd_strerror(setup));
                 closePcm();
                 return false;
             }
@@ -59,15 +57,14 @@ namespace fall_monitoring::infrastructure::audio
             options_ = options;
             handler_ = std::move(onSamples);
             running_.store(true);
-
-            try 
+            try
             {
                 worker_ = std::thread(&Impl::captureLoop, this);
             }
-            catch (const std::exception& e)
+            catch (const std::exception& ex)
             {
                 running_.store(false);
-                SPDLOG_ERROR("[Audio] 创建采集线程失败：{}", e.what());
+                SPDLOG_ERROR("[Audio] 创建采集线程失败：{}", ex.what());
                 closePcm();
                 handler_ = {};
                 return false;
@@ -80,7 +77,6 @@ namespace fall_monitoring::infrastructure::audio
         void stop() noexcept
         {
             running_.store(false);
-
             // ALSA 调用只在采集线程中发生；先 join，再在调用线程关闭句柄。
             // NONBLOCK + 100ms 的 snd_pcm_wait 超时使采集线程能周期性观察停止标志。
             if (worker_.joinable())
@@ -92,11 +88,10 @@ namespace fall_monitoring::infrastructure::audio
                 else
                 {
                     // 不允许采集回调在本线程调用 stop()；由 Application 负责生命周期。
-                    SPDLOG_CRITICAL("[Audio] 禁止从采集回调线程调用 stop()，请在管理线程停止音频");
+                    SPDLOG_CRITICAL("[Audio] 禁止从采集回调线程调用 stop()；请在管理线程停止音频");
                     std::terminate();
                 }
             }
-
             if (pcm_ != nullptr)
             {
                 closePcm();
@@ -105,10 +100,7 @@ namespace fall_monitoring::infrastructure::audio
             handler_ = {};
         }
 
-        [[nodiscard]] bool isRunning() const noexcept
-        {
-            return running_.load();
-        }
+        [[nodiscard]] bool isRunning() const noexcept { return running_.load(); }
 
     private:
         void closePcm() noexcept
@@ -137,14 +129,14 @@ namespace fall_monitoring::infrastructure::audio
             auto lastReport = Clock::now();
             auto lastXrunWarn = Clock::time_point{};
 
-            try 
+            try
             {
                 while (running_.load())
                 {
                     // 非阻塞模式避免设备异常时线程永久卡在 readi()，利于安全退出。
                     const int ready = snd_pcm_wait(pcm_, 100);
                     if (!running_.load()) break;
-                    if (ready == 0 ||ready == -EINTR) continue;
+                    if (ready == 0 || ready == -EINTR) continue;
                     if (ready < 0)
                     {
                         const int recovered = snd_pcm_recover(pcm_, ready, 1);
@@ -170,7 +162,6 @@ namespace fall_monitoring::infrastructure::audio
                                 lastXrunWarn = now;
                             }
                         }
-
                         // 尝试修复 XRUN/挂起/常规设备错误。
                         const int recovered = snd_pcm_recover(pcm_, static_cast<int>(frames), 1);
                         if (recovered < 0)
@@ -180,22 +171,21 @@ namespace fall_monitoring::infrastructure::audio
                         }
                         continue;
                     }
-
                     if (frames == 0) continue;
 
                     normalizedSamples.resize(static_cast<std::size_t>(frames));
                     for (snd_pcm_sframes_t i = 0; i < frames; ++i)
                     {
-                        // int16 [-32768, 32767] -> float [-1.0, 1.0)，与 sherpa-onnx 输入一致。
+                        // int16 [-32768,32767] -> float [-1.0,1.0)，与原 sherpa-onnx 输入一致。
                         normalizedSamples[static_cast<std::size_t>(i)] = static_cast<float>(pcmSamples[static_cast<std::size_t>(i)]) / 32768.0f;
                     }
 
                     // 在采集线程同步调用。不得跨线程持有 normalizedSamples 引用。
                     handler_(normalizedSamples);
                     ++chunks;
-                    sampleCount +=static_cast<std::uint64_t>(frames);
+                    sampleCount += static_cast<std::uint64_t>(frames);
 
-                    const auto now = Clodk::now();
+                    const auto now = Clock::now();
                     const auto elapsed = std::chrono::duration<double>(now - lastReport).count();
                     if (elapsed >= 10.0)
                     {
@@ -205,11 +195,11 @@ namespace fall_monitoring::infrastructure::audio
                     }
                 }
             }
-            catch (const std::exception& e)
+            catch (const std::exception& ex)
             {
-                SPDLOG_ERROR("[Audio] 采集线程异常：{}", e.what());
+                SPDLOG_ERROR("[Audio] 采集线程异常：{}", ex.what());
             }
-            catch(...)
+            catch (...)
             {
                 SPDLOG_ERROR("[Audio] 采集线程发生未知异常");
             }
@@ -235,4 +225,4 @@ namespace fall_monitoring::infrastructure::audio
 
     void AlsaAudioCapture::stop() noexcept { impl_->stop(); }
     bool AlsaAudioCapture::isRunning() const noexcept { return impl_->isRunning(); }
-}
+} // namespace fall_monitoring::infrastructure::audio

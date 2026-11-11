@@ -15,7 +15,7 @@
 
 namespace fall_monitoring::infrastructure::storage
 {
-    namespace 
+    namespace
     {
         // Prepared Statement 的自动回收：所有返回路径都执行 sqlite3_finalize()。
         class Statement final
@@ -40,7 +40,7 @@ namespace fall_monitoring::infrastructure::storage
             explicit operator bool() const noexcept { return statement_ != nullptr; }
             sqlite3_stmt* get() const noexcept { return statement_; }
 
-            bool text(int index, const std::string& value) const 
+            bool text(int index, const std::string& value) const
             {
                 return sqlite3_bind_text(statement_, index, value.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK;
             }
@@ -144,6 +144,7 @@ namespace fall_monitoring::infrastructure::storage
 
     bool SqliteAlertRepository::initializeSchemaLocked()
     {
+        // 字段名称与旧 LocalDatabase 完全一致，旧设备的 .db 文件可以继续使用。
         constexpr const char* createAlerts =
             "CREATE TABLE IF NOT EXISTS alerts ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -179,7 +180,8 @@ namespace fall_monitoring::infrastructure::storage
             SPDLOG_INFO("[Storage] 历史数据库迁移：新增字段 {}", column);
         }
 
-        return executeLocked("CREATE INDEX IF NOT EXISTS idx_alerts_upload ON alerts(upload_status, id);") && executeLocked("CREATE INDEX IF NOT EXISTS idx_alerts_video ON alerts(video_upload_status, id);");
+        return executeLocked("CREATE INDEX IF NOT EXISTS idx_alerts_upload ON alerts(upload_status, id);") &&
+               executeLocked("CREATE INDEX IF NOT EXISTS idx_alerts_video ON alerts(video_upload_status, id);");
     }
 
     bool SqliteAlertRepository::initialize()
@@ -192,7 +194,7 @@ namespace fall_monitoring::infrastructure::storage
             return false;
         }
 
-        try 
+        try
         {
             const auto parent = std::filesystem::path(path_).parent_path();
             if (!parent.empty()) std::filesystem::create_directories(parent);
@@ -214,7 +216,10 @@ namespace fall_monitoring::infrastructure::storage
 
         // WAL 允许后台补传查询与顺序写入共存；FULL 提高突然断电时的持久性。
         // busy_timeout 防止其他进程短时间持锁就立即导致报警落盘失败。
-        if (sqlite3_busy_timeout(db_, 5000) != SQLITE_OK || !executeLocked("PRAGMA journal_mode=WAL;") || !executeLocked("PRAGMA synchronous=FULL;") || !initializeSchemaLocked())
+        if (sqlite3_busy_timeout(db_, 5000) != SQLITE_OK ||
+            !executeLocked("PRAGMA journal_mode=WAL;") ||
+            !executeLocked("PRAGMA synchronous=FULL;") ||
+            !initializeSchemaLocked())
         {
             SPDLOG_ERROR("[Storage] SQLite 初始化失败，拒绝启动事件服务");
             sqlite3_close(db_);
@@ -226,7 +231,7 @@ namespace fall_monitoring::infrastructure::storage
         return true;
     }
 
-    void SqliteAlertRepository::close() noexcept 
+    void SqliteAlertRepository::close() noexcept
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (db_ == nullptr) return;
@@ -236,7 +241,7 @@ namespace fall_monitoring::infrastructure::storage
             db_ = nullptr;
             SPDLOG_INFO("[Storage] SQLite 数据库已关闭");
         }
-        else 
+        else
         {
             // 不在这里强制 sqlite3_close_v2()，避免错误掩盖未回收的语句。
             SPDLOG_CRITICAL("[Storage] SQLite 关闭失败：{}", sqlite3_errmsg(db_));
@@ -298,17 +303,20 @@ namespace fall_monitoring::infrastructure::storage
         return true;
     }
 
-    bool SqliteAlertRepository::loadPendingAlerts(std::vector<domain::event::AlertEvent>& result, std::size_t limit)
+    bool SqliteAlertRepository::loadPendingAlerts(
+        std::vector<domain::event::AlertEvent>& result, std::size_t limit, std::size_t offset)
     {
         result.clear();
         std::lock_guard<std::mutex> lock(mutex_);
-        if (db_ == nullptr || !validLimit(limit)) return false;
+        if (db_ == nullptr || !validLimit(limit) || offset > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            return false;
         constexpr const char* sql =
             "SELECT event_id,device_id,deployment_area,event_type,sources,timestamp,"
             "person_track_id,trigger_x,trigger_y,keyword,video_path,event_status "
-            "FROM alerts WHERE upload_status='PENDING' ORDER BY id ASC LIMIT ?;";
+            "FROM alerts WHERE upload_status='PENDING' ORDER BY id ASC LIMIT ? OFFSET ?;";
         Statement stmt(db_, sql);
-        if (!stmt || !stmt.integer(1, static_cast<int>(limit))) return false;
+        if (!stmt || !stmt.integer(1, static_cast<int>(limit)) || !stmt.integer(2, static_cast<int>(offset)))
+            return false;
         while (true)
         {
             const int rc = sqlite3_step(stmt.get());
@@ -340,6 +348,40 @@ namespace fall_monitoring::infrastructure::storage
     {
         Statement stmt(db_, "SELECT 1 FROM alerts WHERE event_id=? LIMIT 1;");
         return stmt && stmt.text(1, eventId) && sqlite3_step(stmt.get()) == SQLITE_ROW;
+    }
+
+    application::ports::AckCommitResult SqliteAlertRepository::markAsUploadedIfMatches(const domain::event::AlertEvent& sent)
+    {
+        using Result = application::ports::AckCommitResult;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (db_ == nullptr || sent.eventId.empty()) return Result::Error;
+        constexpr const char* sql =
+            "UPDATE alerts SET upload_status='UPLOADED' "
+            "WHERE event_id=? AND upload_status='PENDING' AND device_id=? "
+            "AND deployment_area=? AND event_type=? AND sources=? AND timestamp=? "
+            "AND person_track_id=? AND trigger_x=? AND trigger_y=? AND keyword=? "
+            "AND video_path=? AND event_status=?;";
+        Statement stmt(db_, sql);
+        if (!stmt || !stmt.text(1, sent.eventId) || !stmt.text(2, sent.deviceId) ||
+            !stmt.text(3, sent.deploymentArea) ||
+            !stmt.text(4, domain::event::toString(sent.eventType)) ||
+            !stmt.text(5, sourcesToText(sent.source)) ||
+            !stmt.integer64(6, sent.timestamp) ||
+            !stmt.integer(7, sent.personTrackId) ||
+            !stmt.integer(8, sent.triggerBoxX) ||
+            !stmt.integer(9, sent.triggerBoxY) ||
+            !stmt.text(10, sent.keyword) || !stmt.text(11, sent.videoPath) ||
+            !stmt.text(12, domain::event::toString(sent.status)))
+        {
+            SPDLOG_ERROR("[Storage] 业务 ACK SQL 参数绑定失败：{}", sqlite3_errmsg(db_));
+            return Result::Error;
+        }
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE)
+        {
+            SPDLOG_ERROR("[Storage] 业务 ACK SQL 更新失败：{}", sqlite3_errmsg(db_));
+            return Result::Error;
+        }
+        return sqlite3_changes(db_) > 0 ? Result::Uploaded : Result::Stale;
     }
 
     bool SqliteAlertRepository::markAsUploaded(const std::string& eventId)
@@ -376,15 +418,33 @@ namespace fall_monitoring::infrastructure::storage
         return true;
     }
 
-    bool SqliteAlertRepository::loadPendingVideos(std::vector<application::ports::PendingVideoUpload>& result, std::size_t limit)
+    bool SqliteAlertRepository::markVideoFailed(const std::string& eventId)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (db_ == nullptr || eventId.empty()) return false;
+        Statement stmt(db_,
+            "UPDATE alerts SET video_upload_status='FAILED' "
+            "WHERE event_id=? AND video_upload_status!='UPLOADED';");
+        if (!stmt || !stmt.text(1, eventId) || sqlite3_step(stmt.get()) != SQLITE_DONE)
+        {
+            SPDLOG_ERROR("[Storage] 标记录像失败出错：event_id={}，error={}", eventId, sqlite3_errmsg(db_));
+            return false;
+        }
+        return sqlite3_changes(db_) == 1 || rowExistsLocked(eventId);
+    }
+
+    bool SqliteAlertRepository::loadPendingVideos(
+        std::vector<application::ports::PendingVideoUpload>& result, std::size_t limit, std::size_t offset)
     {
         result.clear();
         std::lock_guard<std::mutex> lock(mutex_);
-        if (db_ == nullptr || !validLimit(limit)) return false;
+        if (db_ == nullptr || !validLimit(limit) || offset > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            return false;
         Statement stmt(db_,
             "SELECT event_id,video_path,video_retry_count FROM alerts "
-            "WHERE video_upload_status='PENDING' AND video_path<>'' ORDER BY id ASC LIMIT ?;");
-        if (!stmt || !stmt.integer(1, static_cast<int>(limit))) return false;
+            "WHERE video_upload_status='PENDING' AND video_path<>'' ORDER BY id ASC LIMIT ? OFFSET ?;");
+        if (!stmt || !stmt.integer(1, static_cast<int>(limit)) || !stmt.integer(2, static_cast<int>(offset)))
+            return false;
         while (true)
         {
             const int rc = sqlite3_step(stmt.get());
@@ -403,11 +463,61 @@ namespace fall_monitoring::infrastructure::storage
         }
     }
 
+    application::ports::AlertCloudState SqliteAlertRepository::getAlertCloudState(const std::string& eventId)
+    {
+        using State = application::ports::AlertCloudState;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (db_ == nullptr || eventId.empty()) return State::Error;
+        Statement stmt(db_, "SELECT upload_status FROM alerts WHERE event_id=? LIMIT 1;");
+        if (!stmt || !stmt.text(1, eventId)) return State::Error;
+        const int rc = sqlite3_step(stmt.get());
+        if (rc == SQLITE_DONE) return State::Missing;
+        if (rc != SQLITE_ROW)
+        {
+            SPDLOG_ERROR("[Storage] 查询报警云端状态失败：{}", sqlite3_errmsg(db_));
+            return State::Error;
+        }
+        return readText(stmt.get(), 0) == "UPLOADED" ? State::Uploaded : State::Pending;
+    }
+
+    application::ports::VideoCommitResult SqliteAlertRepository::markVideoUploadedIfMatches(
+        const std::string& eventId, const std::string& videoPath)
+    {
+        using Result = application::ports::VideoCommitResult;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (db_ == nullptr || eventId.empty() || videoPath.empty()) return Result::Error;
+        Statement stmt(db_,
+            "UPDATE alerts SET video_upload_status='UPLOADED' "
+            "WHERE event_id=? AND video_path=? AND video_upload_status='PENDING';");
+        if (!stmt || !stmt.text(1, eventId) || !stmt.text(2, videoPath) || sqlite3_step(stmt.get()) != SQLITE_DONE)
+        {
+            SPDLOG_ERROR("[Storage] 录像条件确认失败：event_id={}，error={}", eventId, sqlite3_errmsg(db_));
+            return Result::Error;
+        }
+        return sqlite3_changes(db_) == 1 ? Result::Uploaded : Result::Stale;
+    }
+
+    bool SqliteAlertRepository::incrementVideoRetryIfMatches(const std::string& eventId, const std::string& videoPath)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (db_ == nullptr || eventId.empty() || videoPath.empty()) return false;
+        Statement stmt(db_,
+            "UPDATE alerts SET video_retry_count=video_retry_count+1 "
+            "WHERE event_id=? AND video_path=? AND video_upload_status='PENDING';");
+        if (!stmt || !stmt.text(1, eventId) || !stmt.text(2, videoPath) || sqlite3_step(stmt.get()) != SQLITE_DONE)
+        {
+            SPDLOG_ERROR("[Storage] 录像重试次数更新失败：event_id={}，error={}", eventId, sqlite3_errmsg(db_));
+            return false;
+        }
+        return sqlite3_changes(db_) == 1;
+    }
+
     bool SqliteAlertRepository::markVideoUploaded(const std::string& eventId)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (db_ == nullptr || eventId.empty()) return false;
-        Statement stmt(db_, "UPDATE alerts SET video_upload_status='UPLOADED' WHERE event_id=? AND video_upload_status='PENDING';");
+        Statement stmt(db_,
+            "UPDATE alerts SET video_upload_status='UPLOADED' WHERE event_id=? AND video_upload_status='PENDING';");
         if (!stmt || !stmt.text(1, eventId) || sqlite3_step(stmt.get()) != SQLITE_DONE)
         {
             SPDLOG_ERROR("[Storage] 更新录像上传状态失败：event_id={}，error={}", eventId, sqlite3_errmsg(db_));
