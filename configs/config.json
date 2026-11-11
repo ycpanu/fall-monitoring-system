@@ -43,7 +43,9 @@
     },
     "hardware": {
         "buzzer_gpio_pin": 138,
-        "alarm_duration_ms": 3000
+        "alarm_duration_ms": 3000,
+        "buzzer_enabled": true,
+        "buzzer_active_high": true
     },
     "storage": {
         "sqlite_db_path": "fall_detection_gateway.db"

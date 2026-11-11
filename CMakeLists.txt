@@ -65,6 +65,7 @@ get_filename_component(SHERPA_ONNX_LIB_DIR "${SHERPA_ONNX_C_API_LIBRARY}" DIRECT
 add_library(fall_monitoring_core STATIC
     src/app/Application.cpp
     src/application/audio/AudioPipeline.cpp
+    src/application/alarm/LocalAlarmService.cpp
     src/application/vision/VisionPipeline.cpp
     src/application/event/EventService.cpp
     src/application/network/AlertOutboxService.cpp
@@ -75,6 +76,7 @@ add_library(fall_monitoring_core STATIC
     src/domain/vision/FallRuleEngine.cpp
     src/infrastructure/audio/AlsaAudioCapture.cpp
     src/infrastructure/audio/SherpaKeywordSpotter.cpp
+    src/infrastructure/hardware/SysfsBuzzer.cpp
     src/infrastructure/camera/CameraCapture.cpp
     src/infrastructure/config/ConfigManager.cpp
     src/infrastructure/logging/Logger.cpp

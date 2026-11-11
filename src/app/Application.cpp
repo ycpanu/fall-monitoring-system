@@ -1,5 +1,6 @@
 #include "fall_monitoring/app/Application.hpp"
 #include "fall_monitoring/application/audio/AudioPipeline.hpp"
+#include "fall_monitoring/application/alarm/LocalAlarmService.hpp"
 #include "fall_monitoring/application/commands/DeviceCommandService.hpp"
 #include "fall_monitoring/application/event/EventService.hpp"
 #include "fall_monitoring/application/network/AlertOutboxService.hpp"
@@ -10,6 +11,7 @@
 #include "fall_monitoring/domain/vision/PersonTracker.hpp"
 #include "fall_monitoring/infrastructure/audio/AlsaAudioCapture.hpp"
 #include "fall_monitoring/infrastructure/audio/SherpaKeywordSpotter.hpp"
+#include "fall_monitoring/infrastructure/hardware/SysfsBuzzer.hpp"
 #include "fall_monitoring/infrastructure/camera/CameraCapture.hpp"
 #include "fall_monitoring/infrastructure/config/ConfigManager.hpp"
 #include "fall_monitoring/infrastructure/logging/Logger.hpp"
@@ -101,10 +103,7 @@ namespace fall_monitoring::app
             domain::vision::FallRuleEngine ruleEngine(rules, &safeZones);
 
             domain::vision::PersonTracker tracker;
-            infrastructure::rknn::RknnPoseInferencer inferencer(
-                config.getString("model.rknn_model_path", "./models/yolov8n-pose-512-hybrid.rknn"),
-                static_cast<float>(config.getDouble("model.confidence_threshold", 0.5)),
-                static_cast<float>(config.getDouble("model.nms_threshold", 0.45)));
+            infrastructure::rknn::RknnPoseInferencer inferencer(config.getString("model.rknn_model_path", "./models/yolov8n-pose-512-hybrid.rknn"), static_cast<float>(config.getDouble("model.confidence_threshold", 0.5)), static_cast<float>(config.getDouble("model.nms_threshold", 0.45)));
             if (!inferencer.initialize())
             {
                 SPDLOG_ERROR("[APP] RKNN 初始化失败，拒绝启动摄像头监测");
@@ -118,6 +117,26 @@ namespace fall_monitoring::app
                 SPDLOG_CRITICAL("[APP] 本地 SQLite 初始化失败，拒绝启动报警系统");
                 return 1;
             }
+
+            // 本地 GPIO 蜂鸣器是网络无关的告警通道。
+            // 初始化失败时保持 SQLite/MQTT/视觉功能，避免蜂鸣器驱动故障导致监测中断。
+            const int alarmDurationMs = config.getInt("hardware.alarm_duration_ms", 3000);
+            if (alarmDurationMs <= 0 || alarmDurationMs > 60000)
+            {
+                SPDLOG_ERROR("[APP] hardware.alarm_duration_ms 必须位于 1..60000ms");
+                return 1;
+            }
+            infrastructure::hardware::SysfsBuzzerOptions buzzerOptions;
+            buzzerOptions.gpioPin = config.getInt("hardware.buzzer_gpio_pin", 138);
+            buzzerOptions.activeHigh = config.getBool("hardware.buzzer_active_high", true);
+            infrastructure::hardware::SysfsBuzzer buzzer(buzzerOptions);
+            const bool localAlarmEnabled = config.getBool("hardware.buzzer_enabled", true);
+            const bool localAlarmReady = localAlarmEnabled && buzzer.initialize();
+            if (localAlarmEnabled && !localAlarmReady)
+                SPDLOG_ERROR("[APP] 蜂鸣器初始化失败；本地蜂鸣不可用，视觉/语音及网络报警继续运行");
+            else if (!localAlarmEnabled)
+                SPDLOG_INFO("[APP] 本地蜂鸣器已在配置中禁用");
+            application::alarm::LocalAlarmService localAlarm(buzzer, alarmDurationMs);
 
             infrastructure::network::MqttOptions mqttOptions;
             mqttOptions.broker = config.getString("network.mqtt_broker", "tcp://10.48.212.22:1883");
@@ -153,14 +172,12 @@ namespace fall_monitoring::app
             outboxOptions.retrySeconds = config.getInt("network.alert_retry_seconds", 60);
             outboxOptions.reconnectSeconds = config.getInt("network.reconnect_seconds", 10);
             outboxOptions.heartbeatSeconds = config.getInt("network.heartbeat_seconds", 10);
-            application::network::AlertOutboxService outbox(
-                std::move(outboxOptions), alertRepository, mqttClient,
+            application::network::AlertOutboxService outbox(std::move(outboxOptions), alertRepository, mqttClient,
                 [&systemMetrics]() -> std::optional<application::network::DeviceUsage>
                 {
                     const auto metrics = systemMetrics.sample();
                     if (!metrics) return std::nullopt;
-                    return application::network::DeviceUsage{
-                        metrics->cpu, metrics->memory, metrics->storage};
+                    return application::network::DeviceUsage{metrics->cpu, metrics->memory, metrics->storage};
                 },
                 [&commands](const std::string& topic, const std::string& payload)
                 {
@@ -198,9 +215,8 @@ namespace fall_monitoring::app
             recordingOptions.maxOutstanding = static_cast<std::size_t>(maxRecordingTasks);
             recordingOptions.ffmpegBinary = config.getString("video_recording.ffmpeg_binary", "ffmpeg");
             recordingOptions.encoder = config.getString("video_recording.encoder", "h264_rkmpp");
-            infrastructure::video::FfmpegEventRecorder eventRecorder(
-                std::move(recordingOptions),
-                [&alertRepository, &videoUploader](const std::string& eventId,const std::string& path, bool success)
+            infrastructure::video::FfmpegEventRecorder eventRecorder(std::move(recordingOptions),
+                [&alertRepository, &videoUploader](const std::string& eventId, const std::string& path, bool success)
                 {
                     const bool stored = success ? alertRepository.markVideoPending(eventId, path) : alertRepository.markVideoFailed(eventId);
                     if (!stored)
@@ -216,15 +232,17 @@ namespace fall_monitoring::app
             eventOptions.fusionWindowMs = config.getInt("event.fusion_window_ms", 10000);
             eventOptions.queueCapacity = static_cast<std::size_t>(alertQueueCapacity);
             eventOptions.submitTimeout = std::chrono::milliseconds(submitTimeoutMs);
-            application::event::EventService eventService(
-                std::move(eventOptions),
-                [&alertRepository, &outbox, &eventRecorder](const AlertEvent& prepared) -> bool
+            application::event::EventService eventService(std::move(eventOptions),
+                [&alertRepository, &outbox, &eventRecorder, &localAlarm, localAlarmReady](const AlertEvent& prepared) -> bool
                 {
+                    // 事件处理线程中仅投递异步蜂鸣请求，不执行 GPIO I/O；
+                    // 即使 SQLite/MQTT 离线或暂时故障，本地蜂鸣依然可以触发。
+                    // LocalAlarmService 按 event_id 去重，防止 SQLite 重试造成重复鸣叫。
+                    if (localAlarmReady) localAlarm.onPreparedEvent(prepared);
                     const bool saved = alertRepository.saveAlert(prepared);
                     if (!saved) return false;
                     outbox.notifyPersisted();
-                    if (prepared.captureVideo && !prepared.videoPath.empty() &&
-                        !eventRecorder.requestRecording(prepared.eventId, prepared.videoPath))
+                    if (prepared.captureVideo && !prepared.videoPath.empty() && !eventRecorder.requestRecording(prepared.eventId, prepared.videoPath))
                     {
                         SPDLOG_ERROR("[VideoRecord] 报警已落盘，但无法创建录像任务：{}", prepared.eventId);
                         if (!alertRepository.markVideoFailed(prepared.eventId))
@@ -267,8 +285,7 @@ namespace fall_monitoring::app
                     SPDLOG_ERROR("[Audio] PCM 与 KWS 采样率不一致，语音功能降级");
                 else if (!keywordSpotter.initialize(kws))
                     SPDLOG_ERROR("[Audio] KWS 模型初始化失败，继续纯视觉监测");
-                else if (!audioPipeline.start(audioOptions, config.getInt("kws.cooldown_ms", 5000),
-                    [&eventService](AlertEvent event)
+                else if (!audioPipeline.start(audioOptions, config.getInt("kws.cooldown_ms", 5000), [&eventService](AlertEvent event)
                     {
                         const auto keyword = event.keyword;
                         if (!eventService.submit(std::move(event)))
@@ -279,8 +296,7 @@ namespace fall_monitoring::app
             else
                 SPDLOG_INFO("[Audio] 音频/关键词识别已在配置中禁用");
 
-            application::vision::VisionPipeline pipeline(inferencer, tracker, ruleEngine, frames,
-                {}, {}, [&eventService](AlertEvent event)
+            application::vision::VisionPipeline pipeline(inferencer, tracker, ruleEngine, frames, {}, {}, [&eventService](AlertEvent event)
                 {
                     const int trackId = event.personTrackId;
                     if (!eventService.submit(std::move(event)))
@@ -290,8 +306,7 @@ namespace fall_monitoring::app
             infrastructure::camera::CameraOptions cameraOptions;
             cameraOptions.deviceId = config.getInt("vision.camera_device_id", 0);
             if (argc == 2) cameraOptions.videoPath = argv[1];
-            infrastructure::camera::CameraCapture camera(cameraOptions, frames,
-                [&eventRecorder, &liveStreamer](const cv::Mat& frame)
+            infrastructure::camera::CameraCapture camera(cameraOptions, frames, [&eventRecorder, &liveStreamer](const cv::Mat& frame)
                 {
                     eventRecorder.observeFrame(frame);
                     liveStreamer.pushFrame(frame);
@@ -318,6 +333,7 @@ namespace fall_monitoring::app
             outbox.stop();
             commands.stop();
             liveStreamer.stop();
+            buzzer.stop();
             SPDLOG_INFO("[APP] 安全退出，总采集帧数={}", camera.capturedCount());
             return 0;
         }
