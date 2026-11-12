@@ -1,18 +1,29 @@
 #pragma once
 
+#include <memory>
+
 namespace fall_monitoring::app
 {
     /**
-     * @brief 边缘监测应用
-     * 
-     * 1.组织系统各模块的初始化
-     * 2.管理系统的启动和停止
-     * 3.协调应用层服务的生命周期
+     * @brief 组合根：仅负责组件组装及生命周期，不处理操作系统信号。
      */
-    class Application
+    class Application final 
     {
     public:
-        // 启动应用，返回进程退出码
-        int run(int argc, char* argv[]);
+        Application();
+        ~Application();
+        Application(const Application&) = delete;
+        Application& operator=(const Application&) = delete;
+        Application(Application&&) = delete;
+        Application& operator=(Application&&) = delete;
+
+        [[nodiscard]] bool init(int argc, char* argv[]);
+        [[nodiscard]] bool start();
+        [[nodiscard]] bool tick();  // 返回 false 表示核心运行故障，main 应以非零退出码结束。
+        void stop() noexcept;
+
+    private:
+        struct Impl;
+        std::unique_ptr<Impl> impl_;
     };
-} // namespace fall_monitoring::app
+}

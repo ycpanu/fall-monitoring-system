@@ -41,6 +41,11 @@ namespace fall_monitoring::infrastructure::camera
             SPDLOG_ERROR("[Camera] 帧队列已关闭，不能启动采集");
             return false;
         }
+        if (options_.failureExitAfterMs <= 0)
+        {
+            SPDLOG_ERROR("[Camera] failureExitAfterMs 必须大于 0");
+            return false;
+        }
         if (options_.cameraFrameIntervalMs <= 0)
         {
             SPDLOG_ERROR("[Camera] cameraFrameIntervalMs 必须大于 0");
@@ -62,7 +67,7 @@ namespace fall_monitoring::infrastructure::camera
             }
             else
             {
-                // 与旧版行为一致：强制使用 V4L2，并尝试使用 MJPEG 格式。
+                // 强制使用 V4L2，并尝试使用 MJPEG 格式。
                 if (!capture_.open(options_.deviceId, cv::CAP_V4L2))
                 {
                     SPDLOG_ERROR("[Camera] 无法打开摄像头：/dev/video{}", options_.deviceId);
@@ -132,6 +137,7 @@ namespace fall_monitoring::infrastructure::camera
             SPDLOG_INFO("[Camera] 采集线程开始：source={}, interval={}ms", fileMode ? options_.videoPath : "V4L2", interval.count());
 
             auto lastEmptyWarning = std::chrono::steady_clock::time_point{};
+            auto emptySince = std::chrono::steady_clock::time_point{};
             while (running_.load())
             {
                 // 每次新建 Mat，保证进入队列后的数据不被下一次读取复用写坏。
@@ -153,6 +159,13 @@ namespace fall_monitoring::infrastructure::camera
                     {
                         // 节流 WARN，防止摄像头断开时每秒刷屏。
                         const auto now = std::chrono::steady_clock::now();
+                        if (emptySince == std::chrono::steady_clock::time_point{})
+                            emptySince = now;
+                        if (now - emptySince >= std::chrono::milliseconds(options_.failureExitAfterMs))
+                        {
+                            SPDLOG_ERROR("[Camera] 连续 {}ms 无有效视频帧，退出当前采集线程，等待监管器恢复", options_.failureExitAfterMs);
+                            break;
+                        }
                         if (lastEmptyWarning == std::chrono::steady_clock::time_point{} || now - lastEmptyWarning >= 5s)
                         {
                             SPDLOG_WARN("[Camera] 摄像头读取失败或空帧，将继续重试");
@@ -162,6 +175,8 @@ namespace fall_monitoring::infrastructure::camera
                     }
                     continue;
                 }
+
+                emptySince = {}; // 有效视频帧恢复后重置故障计时器。
 
                 // 观察者只观察这一帧。录像/推流模块应在自己的队列内异步处理。
                 if (onFrame_)
@@ -201,4 +216,4 @@ namespace fall_monitoring::infrastructure::camera
         running_ = false;
         SPDLOG_INFO("[Camera] 采集线程退出");
     }
-} // namespace fall_monitoring::infrastructure::camera
+}

@@ -68,6 +68,7 @@ add_library(fall_monitoring_core STATIC
     src/application/alarm/LocalAlarmService.cpp
     src/application/vision/VisionPipeline.cpp
     src/application/event/EventService.cpp
+    src/application/runtime/RuntimeSupervisor.cpp
     src/application/network/AlertOutboxService.cpp
     src/application/network/VideoUploadService.cpp
     src/application/commands/DeviceCommandService.cpp
@@ -86,6 +87,7 @@ add_library(fall_monitoring_core STATIC
     src/infrastructure/network/AlertJsonCodec.cpp
     src/infrastructure/network/CurlVideoUploadTransport.cpp
     src/infrastructure/system/SystemMetrics.cpp
+    src/infrastructure/system/SystemdNotifier.cpp
     src/infrastructure/storage/SqliteAlertRepository.cpp
     src/infrastructure/video/FfmpegEventRecorder.cpp
     src/infrastructure/video/FfmpegLiveStreamer.cpp

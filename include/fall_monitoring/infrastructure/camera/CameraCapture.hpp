@@ -21,6 +21,7 @@ namespace fall_monitoring::infrastructure::camera
         int deviceId = 0;               // 摄像头模式：/dev/video0 等设备索引
         std::string videoPath;          // 非空则使用本地视频文件，播放到末尾自动循环
         int cameraFrameIntervalMs = 33; // 保留旧工程的约 30FPS 软件限速策略
+        int failureExitAfterMs = 10000; // 连续空帧达到阈值时退出采集线程，让监管器重建 V4L2 句柄。
     };
 
     /**
@@ -43,8 +44,7 @@ namespace fall_monitoring::infrastructure::camera
         using FrameQueue = concurrency::LatestFrameQueue<cv::Mat>;
         using FrameObserver = std::function<void(const cv::Mat&)>;
 
-        CameraCapture(CameraOptions options, FrameQueue& output,
-                      FrameObserver onFrame = {});
+        CameraCapture(CameraOptions options, FrameQueue& output, FrameObserver onFrame = {});
         ~CameraCapture();
 
         CameraCapture(const CameraCapture&) = delete;
@@ -69,4 +69,4 @@ namespace fall_monitoring::infrastructure::camera
         std::atomic<bool> running_{false};
         std::atomic<std::uint64_t> capturedCount_{0};
     };
-} // namespace fall_monitoring::infrastructure::camera
+}

@@ -28,10 +28,10 @@ namespace fall_monitoring::application::event
 
     /**
      * @brief 事件的单一入口和顺序分发服务
-     * 
+     *
      * 视觉推理线程和 ALSA 采集线程只调用 submit()，不直接融合事件
      */
-    class EventService final 
+    class EventService final
     {
     public:
         // 返回 true 表示已成功提交持久化；false 表示需要保留并重试。
@@ -57,6 +57,9 @@ namespace fall_monitoring::application::event
          * @note 调用方必须先停止所有事件生产者；不可在事件回调内调用 stop()。
          */
         void stop() noexcept;
+
+        /** @brief 最近队列内尚未被消费者领取的事件个数；线程安全。 */
+        [[nodiscard]] std::size_t pendingCount() const { return queue_.size(); }
 
     private:
         void consumeLoop() noexcept;

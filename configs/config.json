@@ -10,6 +10,7 @@
     "vision": {
         "camera_device_id": 0,
         "frame_queue_size": 3,
+        "camera_failure_exit_ms": 10000,
         "video_cache_frames": 90,
         "video_save_fps": 30,
         "video_output_dir": "videos"
@@ -103,6 +104,15 @@
         "retry_max_seconds": 300,
         "scan_seconds": 2,
         "batch_size": 100
+    },
+    "runtime": {
+        "check_interval_ms": 500,
+        "camera_stall_ms": 15000,
+        "camera_restart_delay_ms": 3000,
+        "max_camera_restarts": 5,
+        "audio_retry_initial_ms": 3000,
+        "audio_retry_max_ms": 60000,
+        "report_interval_ms": 10000
     },
     "scene": {
         "config_path": "configs/scene_config.json"
