@@ -103,7 +103,7 @@ namespace fall_monitoring::domain::vision
             // =====================================================
             // 关键点检查
             // =====================================================
-            if (target.keypoints.size() < 17)
+            if (target.keyPoints.size() < 17)
             {
                 /*
                 * 这里不能 reset。
@@ -114,7 +114,7 @@ namespace fall_monitoring::domain::vision
                 return false;
             }
 
-            const auto& kp = target.keypoints;
+            const auto& kp = target.keyPoints;
 
             const bool leftShoulderValid = kp[L_SHOULDER].confidence >= config_.kptConfThreshold;
 

@@ -112,11 +112,23 @@ if(nlohmann_json_FOUND)
     target_link_libraries(fall_monitoring_core PUBLIC nlohmann_json::nlohmann_json)
 endif()
 target_link_options(fall_monitoring_core INTERFACE
-    "-Wl,-rpath-link,${SHERPA_ONNX_LIB_DIR}")
+    "-Wl,-rpath-link,${SHERPA_ONNX_LIB_DIR}"
+    "-Wl,-rpath-link,${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/blas"
+    "-Wl,-rpath-link,${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/lapack")
 target_compile_definitions(fall_monitoring_core PUBLIC
     SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE)
 target_compile_options(fall_monitoring_core PRIVATE
     -Wall -Wextra -Wpedantic)
 
+# 中间构建产物由 cmake -B build 写入 build/；仅最终可执行程序输出至 bin/。
 add_executable(fall_monitoring_gateway apps/main.cpp)
 target_link_libraries(fall_monitoring_gateway PRIVATE fall_monitoring_core)
+set_target_properties(fall_monitoring_gateway PROPERTIES
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH "$ORIGIN/../third_party/sherpa-onnx/lib"
+    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${PROJECT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${PROJECT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${PROJECT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${PROJECT_SOURCE_DIR}/bin"
+)

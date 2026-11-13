@@ -5,6 +5,8 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -33,7 +35,10 @@ namespace fall_monitoring::infrastructure::logging
             auto logger = std::make_shared<spdlog::async_logger>("FallMonitoring", sinks.begin(), sinks.end(), spdlog::thread_pool(), spdlog::async_overflow_policy::block);
 
             logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%t] [%^%l%$] [%s:%#] %v");
-            logger->set_level(spdlog::level::from_str(level));
+            std::string normalizedLevel = level;
+            std::transform(normalizedLevel.begin(), normalizedLevel.end(), normalizedLevel.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            logger->set_level(spdlog::level::from_str(normalizedLevel));
             logger->flush_on(spdlog::level::err);
             spdlog::set_default_logger(logger);
             initialized_ = true;

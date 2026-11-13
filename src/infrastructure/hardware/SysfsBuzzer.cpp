@@ -40,6 +40,12 @@ namespace fall_monitoring::infrastructure::hardware
 
     SysfsBuzzer::~SysfsBuzzer() { stop(); }
 
+    bool SysfsBuzzer::writeValue(bool enabled) noexcept
+    {
+        const bool high = enabled == options_.activeHigh;
+        return writeSysfs(valuePath_, high ? "1" : "0");
+    }
+
     bool SysfsBuzzer::initialize()
     {
         std::lock_guard<std::mutex> lock(mutex_);

@@ -2,6 +2,9 @@
 build/
 cmake-build-*/
 
+# 最终可执行程序及其他发布二进制，不提交 Git
+bin/
+
 # 编译产物
 *.o
 *.a
@@ -26,3 +29,7 @@ logs/
 # Python 缓存
 __pycache__/
 *.pyc
+
+/sysroot
+
+/third_party

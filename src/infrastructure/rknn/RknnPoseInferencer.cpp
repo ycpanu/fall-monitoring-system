@@ -329,14 +329,14 @@ namespace fall_monitoring::infrastructure::rknn
                 box.width = static_cast<int>(w / scale);
                 box.height = static_cast<int>(h / scale);
 
-                box.keypoints.reserve(NUM_KEYPOINTS);
+                box.keyPoints.reserve(NUM_KEYPOINTS);
                 for (int k = 0; k < NUM_KEYPOINTS; k++)
                 {
                     KeyPoint kp;
                     kp.x = static_cast<int>((outData[(KPT_OFFSET + k * 3 + 0) * NUM_ANCHORS + i] - padW) / scale);
                     kp.y = static_cast<int>((outData[(KPT_OFFSET + k * 3 + 1) * NUM_ANCHORS + i] - padH) / scale);
                     kp.confidence = outData[(KPT_OFFSET + k * 3 + 2) * NUM_ANCHORS + i];
-                    box.keypoints.push_back(kp);
+                    box.keyPoints.push_back(kp);
                 }
 
                 candidates.push_back(box);
@@ -359,7 +359,7 @@ namespace fall_monitoring::infrastructure::rknn
             }
             else
             {
-                SPDLOG_TRACE("本帧解析出 {} 个人体，第一个含 {} 个关键点", results.size(), results[0].keypoints.size());
+                SPDLOG_TRACE("本帧解析出 {} 个人体，第一个含 {} 个关键点", results.size(), results[0].keyPoints.size());
             }
 
             // 传入 .data() 获取底层指针
