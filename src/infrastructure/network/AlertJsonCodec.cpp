@@ -12,7 +12,7 @@ namespace fall_monitoring::infrastructure::network
         data["trigger_x"] = event.triggerBoxX;
         data["trigger_y"] = event.triggerBoxY;
         if (!event.keyword.empty()) data["keyword"] = event.keyword;
-        // 录像文件经 HTTP 独立上传，旧 MQTT 协议中 video_url 先传空字符串。
+        // 录像文件经 HTTP 独立上传。
         data["video_url"] = "";
 
         nlohmann::json sources = nlohmann::json::array();
@@ -21,6 +21,7 @@ namespace fall_monitoring::infrastructure::network
 
         nlohmann::json message;
         message["event_id"] = event.eventId;
+        message["revision"] = event.revision;
         message["device_id"] = event.deviceId;
         message["deployment_area"] = event.deploymentArea;
         message["event_type"] = domain::event::toString(event.eventType);

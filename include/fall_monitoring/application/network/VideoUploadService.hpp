@@ -41,6 +41,7 @@ namespace fall_monitoring::application::network
         VideoUploadService& operator=(const VideoUploadService&) = delete;
 
         [[nodiscard]] bool start();
+        [[nodiscard]] bool isRunning() const noexcept { return running_.load(); }
         void notifyNewTask() noexcept;
         void stop() noexcept;
 
@@ -61,5 +62,6 @@ namespace fall_monitoring::application::network
         bool wakeRequested_ = false;
         std::unordered_map<std::string, Clock::time_point> nextAttempt_;
         std::size_t scanOffset_ = 0;
+        std::size_t recoveryOffset_ = 0;
     };
 }

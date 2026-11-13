@@ -67,6 +67,7 @@ namespace fall_monitoring::app
         bool startedOnce = false;
         bool started = false;
         bool stopped = false;
+        std::chrono::steady_clock::time_point nextServiceRestart{};
         std::atomic<bool> stopRequested{false};
         std::atomic<bool> visionExited{false};
         std::atomic<bool> visionFailed{false};
@@ -134,7 +135,8 @@ namespace fall_monitoring::app
             videoInputPath = argc == 2 ? argv[1] : "";
             audioExpected = config.getBool("audio.enabled", true) && config.getBool("kws.enabled", true);
 
-            frames = std::make_unique<concurrency::LatestFrameQueue<cv::Mat>>(static_cast<std::size_t>(frameCapacity));
+            frames = std::make_unique<concurrency::LatestFrameQueue<cv::Mat>>(
+                static_cast<std::size_t>(frameCapacity));
             safeZones = std::make_unique<infrastructure::scene::SafeZoneManager>();
             if (!safeZones->load(scenePath))
                 SPDLOG_WARN("[APP] 安全区域配置不可用：{}；继续监测", scenePath);
@@ -201,8 +203,7 @@ namespace fall_monitoring::app
             application::commands::DeviceCommandOptions commandOptions;
             commandOptions.deviceId = deviceId;
             commandOptions.sceneConfigPath = scenePath;
-            commands = std::make_unique<application::commands::DeviceCommandService>(
-                std::move(commandOptions), *safeZones, *liveStreamer, *mqttClient);
+            commands = std::make_unique<application::commands::DeviceCommandService>(std::move(commandOptions), *safeZones, *liveStreamer, *mqttClient);
 
             application::network::AlertOutboxOptions outboxOptions;
             outboxOptions.deviceId = deviceId;
@@ -211,8 +212,7 @@ namespace fall_monitoring::app
             outboxOptions.retrySeconds = config.getInt("network.alert_retry_seconds", 60);
             outboxOptions.reconnectSeconds = config.getInt("network.reconnect_seconds", 10);
             outboxOptions.heartbeatSeconds = config.getInt("network.heartbeat_seconds", 10);
-            outbox = std::make_unique<application::network::AlertOutboxService>(
-                std::move(outboxOptions), *alertRepository, *mqttClient,
+            outbox = std::make_unique<application::network::AlertOutboxService>(std::move(outboxOptions), *alertRepository, *mqttClient,
                 [this]() -> std::optional<application::network::DeviceUsage>
                 {
                     const auto metrics = systemMetrics->sample();
@@ -238,7 +238,8 @@ namespace fall_monitoring::app
             uploadOptions.batchSize = static_cast<std::size_t>(videoBatch);
             videoUploader = std::make_unique<application::network::VideoUploadService>(
                 std::move(uploadOptions), *alertRepository, *videoTransport,
-                [this] { return outbox->isConnected(); });
+                // HTTP 与 MQTT 是独立链路；是否可上传由实际 HTTP 结果和数据库 ACK 判定。
+                [] { return true; });
 
             infrastructure::video::EventVideoOptions recordingOptions;
             recordingOptions.preFrames = config.getInt("vision.video_cache_frames", 90);
@@ -274,7 +275,8 @@ namespace fall_monitoring::app
                 std::move(eventOptions), [this](const AlertEvent& event) -> bool
                 {
                     // 本地报警先于 SQLite；事件重试与多模态融合按 event_id 去重。
-                    if (localAlarmReady) localAlarm->onPreparedEvent(event);
+                    if (localAlarmReady && !event.localAlarmAlreadyRequested)
+                        localAlarm->onPreparedEvent(event);
                     if (!alertRepository->saveAlert(event)) return false;
                     outbox->notifyPersisted();
                     if (event.captureVideo && !event.videoPath.empty() &&
@@ -285,6 +287,10 @@ namespace fall_monitoring::app
                             SPDLOG_CRITICAL("[VideoRecord] 无法记录录像失败状态：{}", event.eventId);
                     }
                     return true;
+                }, *alertRepository,
+                [this]() -> bool
+                {
+                    return localAlarmReady && buzzer->trigger(std::chrono::milliseconds(alertDurationMs));
                 });
 
             audioCapture = std::make_unique<infrastructure::audio::AlsaAudioCapture>();
@@ -298,7 +304,11 @@ namespace fall_monitoring::app
                 {
                     const int trackId = event.personTrackId;
                     if (!eventService->submit(std::move(event)))
-                        SPDLOG_CRITICAL("[Vision] 跌倒事件入队失败，track={}", trackId);
+                    {
+                        if (localAlarmReady)
+                            (void)buzzer->trigger(std::chrono::milliseconds(alertDurationMs));
+                        SPDLOG_CRITICAL("[Vision] 跌倒事件入队及溢出持久化均失败，已请求应急本地蜂鸣，track={}", trackId);
+                    }
                 });
 
             infrastructure::camera::CameraOptions cameraOptions;
@@ -361,7 +371,11 @@ namespace fall_monitoring::app
             {
                 const std::string keyword = event.keyword;
                 if (!eventService->submit(std::move(event)))
-                    SPDLOG_CRITICAL("[Audio] 语音报警入队失败：keyword={}", keyword);
+                {
+                    if (localAlarmReady)
+                        (void)buzzer->trigger(std::chrono::milliseconds(alertDurationMs));
+                    SPDLOG_CRITICAL("[Audio] 求救入队及溢出持久化均失败，已请求应急本地蜂鸣：keyword={}", keyword);
+                }
             });
         }
 
@@ -402,8 +416,7 @@ namespace fall_monitoring::app
             callbacks.restartAudio = [this] { return restartAudio(); };
             callbacks.mqttConnected = [this] { return outbox->isConnected(); };
             callbacks.queuedEvents = [this] { return eventService->pendingCount(); };
-            supervisor = std::make_unique<application::runtime::RuntimeSupervisor>(
-                runtimeOptions, std::move(callbacks), *systemdNotifier);
+            supervisor = std::make_unique<application::runtime::RuntimeSupervisor>(runtimeOptions, std::move(callbacks), *systemdNotifier);
 
             // start() 不阻塞在视觉推理；主线程继续负责运行监管与信号处理。
             stopRequested.store(false);
@@ -438,6 +451,17 @@ namespace fall_monitoring::app
             started = true;
             SPDLOG_INFO("[APP] 采集、视觉、事件、网络和运行监管已启动");
             return true;
+        }
+
+        void restoreBackgroundServices()
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < nextServiceRestart) return;
+            nextServiceRestart = now + std::chrono::seconds(10);
+            if (outbox && !outbox->isRunning() && !outbox->start())
+                SPDLOG_ERROR("[APP] MQTT Outbox 后台线程恢复失败；SQLite 仍保留待发事件");
+            if (config.getBool("video_upload.enabled", true) && videoUploader && !videoUploader->isRunning() && !videoUploader->start())
+                SPDLOG_ERROR("[APP] HTTP 上传后台线程恢复失败；保留待传录像");
         }
 
         void shutdown() noexcept
@@ -525,6 +549,7 @@ namespace fall_monitoring::app
         }
         try
         {
+            impl_->restoreBackgroundServices();
             return impl_->supervisor->tick();
         }
         catch (const std::exception& error)

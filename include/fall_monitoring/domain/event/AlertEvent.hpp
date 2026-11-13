@@ -6,20 +6,19 @@
 
 namespace fall_monitoring::domain::event
 {
-    // JSON 序列化、MQTT 发送与 SQLite 入库不在领域层实现。
     enum class EventType { FALL, HELP_REQUEST };
     enum class EventSource { VISION, VOICE };
     enum class EventStatus { NEW, ACKNOWLEDGED, RESOLVED };
 
     struct AlertEvent
     {
-        std::string eventId;          
-        std::string deviceId;      
-        std::string deploymentArea;  
+        std::string eventId;
+        std::string deviceId;
+        std::string deploymentArea;
         EventType eventType = EventType::FALL;
         std::vector<EventSource> source;
         EventStatus status = EventStatus::NEW;
-        std::int64_t timestamp = 0; 
+        std::int64_t timestamp = 0;
         int personTrackId = -1;
         int triggerBoxX = 0;
         int triggerBoxY = 0;
@@ -27,6 +26,11 @@ namespace fall_monitoring::domain::event
         std::string videoPath;
         bool isFusionUpdate = false;
         bool captureVideo = false;
+        // 入队拥塞时已请求本地 GPIO 蜂鸣，恢复处理时不重复鸣叫。
+        bool localAlarmAlreadyRequested = false;
+        // 单一报警的业务版本。首次为 1，每次跨模态融合递增。
+        // 业务 ACK 必须确认与发送快照相同的版本才可将其标记为 UPLOADED。
+        std::uint64_t revision = 1;
     };
 
     inline const char* toString(EventType value) noexcept
@@ -59,4 +63,4 @@ namespace fall_monitoring::domain::event
         }
         return "UNKNOWN";
     }
-} 
+}

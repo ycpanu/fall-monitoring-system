@@ -11,12 +11,8 @@
 
 namespace fall_monitoring::application::network
 {
-    VideoUploadService::VideoUploadService(VideoUploadOptions options,
-        ports::IAlertRepository& repository,
-        ports::IVideoUploadTransport& transport,
-        ConnectivityProvider isOnline)
-        : options_(std::move(options)), repository_(repository), transport_(transport),
-          isOnline_(std::move(isOnline))
+    VideoUploadService::VideoUploadService(VideoUploadOptions options, ports::IAlertRepository& repository, ports::IVideoUploadTransport& transport, ConnectivityProvider isOnline)
+        : options_(std::move(options)), repository_(repository), transport_(transport), isOnline_(std::move(isOnline))
     {
         if (!isOnline_ || options_.retryInitialSeconds <= 0 ||
             options_.retryMaxSeconds < options_.retryInitialSeconds ||
@@ -28,11 +24,9 @@ namespace fall_monitoring::application::network
 
     bool VideoUploadService::start()
     {
-        if (startedOnce_.exchange(true))
-        {
-            SPDLOG_ERROR("[VideoUpload] 同一个服务实例不能重复启动");
-            return false;
-        }
+        if (running_.load()) return true;
+        if (worker_.joinable()) worker_.join();
+        startedOnce_.store(true);
         running_.store(true);
         try { worker_ = std::thread(&VideoUploadService::run, this); }
         catch (const std::exception& e)
@@ -41,7 +35,9 @@ namespace fall_monitoring::application::network
             SPDLOG_ERROR("[VideoUpload] 无法创建上传线程：{}", e.what());
             return false;
         }
-        SPDLOG_INFO("[VideoUpload] 上传线程启动：scan={}s, retry={}..{}s, batch={}", options_.scanSeconds, options_.retryInitialSeconds, options_.retryMaxSeconds, options_.batchSize);
+        SPDLOG_INFO("[VideoUpload] 上传线程启动：scan={}s, retry={}..{}s, batch={}",
+                    options_.scanSeconds, options_.retryInitialSeconds,
+                    options_.retryMaxSeconds, options_.batchSize);
         return true;
     }
 
@@ -71,6 +67,16 @@ namespace fall_monitoring::application::network
         {
             try
             {
+                // 每轮检查少量已生成 MP4 与 SQLite 状态，修复回调落库失败或异常重启的遗漏。
+                std::size_t scanned = 0;
+                if (repository_.reconcileRecordedVideos(options_.batchSize, recoveryOffset_, scanned))
+                    recoveryOffset_ = scanned == options_.batchSize ? recoveryOffset_ + scanned : 0;
+                else
+                {
+                    SPDLOG_ERROR("[VideoUpload] 录像状态恢复扫描失败");
+                    recoveryOffset_ = 0;
+                }
+
                 const bool online = isOnline_();
                 if (online && !wasOnline)
                 {
@@ -109,7 +115,7 @@ namespace fall_monitoring::application::network
                             const auto cloud = repository_.getAlertCloudState(video.eventId);
                             if (cloud == ports::AlertCloudState::Pending)
                             {
-                                // 旧后端要求事件先入库再上传 MP4：未收到 SAVED 业务 ACK 不发视频。
+                                // 要求事件先入库再上传 MP4：未收到 SAVED 业务 ACK 不发视频。
                                 continue;
                             }
                             if (cloud != ports::AlertCloudState::Uploaded)
@@ -146,8 +152,7 @@ namespace fall_monitoring::application::network
 
                             if (!repository_.incrementVideoRetryIfMatches(video.eventId, video.videoPath))
                                 SPDLOG_ERROR("[VideoUpload] 无法持久化重试次数（或录像记录已变化）：{}", video.eventId);
-                            nextAttempt_[video.eventId] = Clock::now() +
-                                retryDelay(video.retryCount + 1);
+                            nextAttempt_[video.eventId] = Clock::now() + retryDelay(video.retryCount + 1);
                         }
                     }
                 }
@@ -167,6 +172,7 @@ namespace fall_monitoring::application::network
             });
             wakeRequested_ = false;
         }
+        running_.store(false);
         SPDLOG_INFO("[VideoUpload] 上传工作线程退出");
     }
 

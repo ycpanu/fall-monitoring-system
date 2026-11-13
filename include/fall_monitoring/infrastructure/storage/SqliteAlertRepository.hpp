@@ -3,6 +3,7 @@
 #include "fall_monitoring/application/ports/IAlertRepository.hpp"
 
 #include <mutex>
+#include <cstdint>
 #include <string>
 
 struct sqlite3;
@@ -22,6 +23,10 @@ namespace fall_monitoring::infrastructure::storage
 
         [[nodiscard]] bool initialize();
         void close() noexcept;
+        [[nodiscard]] bool stashIncoming(const domain::event::AlertEvent& raw) override;
+        [[nodiscard]] bool loadIncoming(std::vector<application::ports::PendingIncomingEvent>& batch, std::size_t limit = 1) override;
+        [[nodiscard]] bool eraseIncoming(std::int64_t rowId) override;
+        [[nodiscard]] bool reconcileRecordedVideos(std::size_t limit, std::size_t offset, std::size_t& scanned) override;
         [[nodiscard]] bool saveAlert(const domain::event::AlertEvent& event) override;
         [[nodiscard]] bool loadPendingAlerts(std::vector<domain::event::AlertEvent>& result, std::size_t limit = 100, std::size_t offset = 0) override;
         [[nodiscard]] bool markAsUploaded(const std::string& eventId) override;
@@ -45,4 +50,4 @@ namespace fall_monitoring::infrastructure::storage
         sqlite3* db_ = nullptr;
         mutable std::mutex mutex_;
     };
-} // namespace fall_monitoring::infrastructure::storage
+}

@@ -59,6 +59,7 @@ namespace fall_monitoring::application::network
         /** SQLite 成功落盘后通知补传线程；不能在落盘前调用。 */
         void notifyPersisted() noexcept;
         [[nodiscard]] bool isConnected() const noexcept;
+        [[nodiscard]] bool isRunning() const noexcept { return running_.load(); }
 
     private:
         using Clock = std::chrono::steady_clock;

@@ -10,9 +10,7 @@
 
 namespace fall_monitoring::application::runtime
 {
-    RuntimeSupervisor::RuntimeSupervisor(RuntimeSupervisorOptions options,
-                                         RuntimeSupervisorCallbacks callbacks,
-                                         ports::IRuntimeNotifier& notifier)
+    RuntimeSupervisor::RuntimeSupervisor(RuntimeSupervisorOptions options, RuntimeSupervisorCallbacks callbacks, ports::IRuntimeNotifier& notifier)
         : options_(std::move(options)), callbacks_(std::move(callbacks)), notifier_(notifier)
     {
         if (options_.checkIntervalMs < 100 || options_.cameraStallMs < 1000 ||
@@ -30,9 +28,7 @@ namespace fall_monitoring::application::runtime
         lastFrameAt_ = now;
         lastReport_ = now;
         nextAudioAttempt_ = now;
-        SPDLOG_INFO("[Runtime] 监管器已就绪：cameraStall={}ms，cameraRetries={}，audioRecovery={}",
-                    options_.cameraStallMs, options_.maxCameraRestarts,
-                    options_.audioExpected);
+        SPDLOG_INFO("[Runtime] 监管器已就绪：cameraStall={}ms，cameraRetries={}，audioRecovery={}", options_.cameraStallMs, options_.maxCameraRestarts, options_.audioExpected);
     }
 
     RuntimeSupervisor::~RuntimeSupervisor() { stopping(); }
@@ -45,8 +41,7 @@ namespace fall_monitoring::application::runtime
             fatal_ = true;
             return false;
         }
-        if (lastCameraAttempt_ != Clock::time_point{} &&
-            now - lastCameraAttempt_ < std::chrono::milliseconds(options_.cameraRestartDelayMs))
+        if (lastCameraAttempt_ != Clock::time_point{} && now - lastCameraAttempt_ < std::chrono::milliseconds(options_.cameraRestartDelayMs))
             return true;
 
         lastCameraAttempt_ = now;
@@ -61,6 +56,7 @@ namespace fall_monitoring::application::runtime
                 // start() 不代表有视频帧。只有计数真正前进才重置连续失败次数。
                 lastFrames_ = callbacks_.cameraFrames();
                 lastFrameAt_ = Clock::now();
+                seenFrame_ = false; // start() 不是健康帧，禁止在新帧出现前发送 READY/Watchdog。
                 SPDLOG_INFO("[Runtime] 摄像头采集线程已重新启动，等待实际视频帧");
             }
             else
@@ -115,8 +111,7 @@ namespace fall_monitoring::application::runtime
         SPDLOG_WARN("[Runtime] 音频仍不可用，{}ms 后再尝试；视觉报警继续运行", delay);
     }
 
-    void RuntimeSupervisor::report(Clock::time_point now, bool cameraOnline,
-                                   bool audioOnline, bool mqttOnline)
+    void RuntimeSupervisor::report(Clock::time_point now, bool cameraOnline, bool audioOnline, bool mqttOnline)
     {
         if (now - lastReport_ < std::chrono::milliseconds(options_.reportIntervalMs)) return;
         lastReport_ = now;
@@ -168,8 +163,11 @@ namespace fall_monitoring::application::runtime
 
         if (callbacks_.cameraRunning() && now - lastFrameAt_ < std::chrono::milliseconds(options_.cameraStallMs))
         {
-            if (seenFrame_) notifier_.ready();
-            notifier_.heartbeat();
+            if (seenFrame_)
+            {
+                notifier_.ready();
+                notifier_.heartbeat();
+            }
         }
         return true;
     }

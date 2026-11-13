@@ -16,14 +16,8 @@ namespace fall_monitoring::domain::event
         }
     }
 
-    EventCorrelator::EventCorrelator(std::string deviceId,
-                                     std::string deploymentArea,
-                                     std::string videoOutputDir,
-                                     std::int64_t fusionWindowMs)
-        : deviceId_(std::move(deviceId)),
-          deploymentArea_(std::move(deploymentArea)),
-          videoOutputDir_(std::move(videoOutputDir)),
-          fusionWindowMs_(fusionWindowMs)
+    EventCorrelator::EventCorrelator(std::string deviceId, std::string deploymentArea, std::string videoOutputDir, std::int64_t fusionWindowMs)
+        : deviceId_(std::move(deviceId)), deploymentArea_(std::move(deploymentArea)), videoOutputDir_(std::move(videoOutputDir)), fusionWindowMs_(fusionWindowMs)
     {
         if (deviceId_.empty() || fusionWindowMs_ < 0)
         {
@@ -38,7 +32,7 @@ namespace fall_monitoring::domain::event
 
     std::string EventCorrelator::makeEventId(std::int64_t timestamp)
     {
-        // 设备 ID + Unix 毫秒 + 进程内递增序号。
+        // 与旧项目一致：设备 ID + Unix 毫秒 + 进程内递增序号。
         // 即使同一毫秒收到两条原始事件，也不会产生重复 ID。
         return deviceId_ + "_" + std::to_string(timestamp) + "_" + std::to_string(nextSequence_++);
     }
@@ -69,7 +63,10 @@ namespace fall_monitoring::domain::event
             const auto second = event.timestamp;
             const auto diff = first > second ? first - second : second - first;
             const bool crossModal = (incomingVision && hasSource(activeEvent_, EventSource::VOICE)) || (incomingVoice && hasSource(activeEvent_, EventSource::VISION));
-            canFuse = diff <= fusionWindowMs_ && crossModal;
+            // 已融合的记录不能再吞并第三个事件，防止另一人的跌倒复用同一 event_id。
+            // 仅允许单来源事件首次与另一模态融合。
+            const bool alreadyFused = hasSource(activeEvent_, EventSource::VISION) && hasSource(activeEvent_, EventSource::VOICE);
+            canFuse = !alreadyFused && diff <= fusionWindowMs_ && crossModal;
         }
 
         if (canFuse)
@@ -79,6 +76,8 @@ namespace fall_monitoring::domain::event
             event.eventType = activeEvent_.eventType;
             event.timestamp = activeEvent_.timestamp;
             event.isFusionUpdate = true;
+            event.localAlarmAlreadyRequested = event.localAlarmAlreadyRequested || activeEvent_.localAlarmAlreadyRequested;
+            event.revision = activeEvent_.revision + 1;
             event.source = activeEvent_.source;
 
             if (incomingVision && !hasSource(event, EventSource::VISION))
@@ -104,6 +103,7 @@ namespace fall_monitoring::domain::event
         }
 
         event.isFusionUpdate = false;
+        event.revision = 1;
         if (incomingVision)
         {
             event.videoPath = (std::filesystem::path(videoOutputDir_) / ("fall_" + event.eventId + ".mp4")).string();

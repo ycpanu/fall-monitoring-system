@@ -3,11 +3,18 @@
 #include "fall_monitoring/domain/event/AlertEvent.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace fall_monitoring::application::ports
 {
+    struct PendingIncomingEvent
+    {
+        std::int64_t rowId = 0;
+        domain::event::AlertEvent event;
+    };
+
     struct PendingVideoUpload
     {
         std::string eventId;
@@ -29,6 +36,13 @@ namespace fall_monitoring::application::ports
     {
     public:
         virtual ~IAlertRepository() = default;
+
+        // 仅在常规有界队列拥塞时使用 SQLite 持久化接入缓存；未成功持久化不可报告入队成功。
+        [[nodiscard]] virtual bool stashIncoming(const domain::event::AlertEvent& raw) = 0;
+        [[nodiscard]] virtual bool loadIncoming(std::vector<PendingIncomingEvent>& batch, std::size_t limit = 1) = 0;
+        [[nodiscard]] virtual bool eraseIncoming(std::int64_t rowId) = 0;
+        // 校正“MP4 已原子落盘但完成回调更新数据库失败”的记录。
+        [[nodiscard]] virtual bool reconcileRecordedVideos(std::size_t limit, std::size_t offset, std::size_t& scanned) = 0;
 
         [[nodiscard]] virtual bool saveAlert(const domain::event::AlertEvent& event) = 0;
         [[nodiscard]] virtual bool loadPendingAlerts(std::vector<domain::event::AlertEvent>& result, std::size_t limit = 100, std::size_t offset = 0) = 0;

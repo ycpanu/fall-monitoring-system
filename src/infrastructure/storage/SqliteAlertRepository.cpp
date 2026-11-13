@@ -1,6 +1,7 @@
 #include "fall_monitoring/infrastructure/storage/SqliteAlertRepository.hpp"
 
 #include <sqlite3.h>
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <initializer_list>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -162,12 +164,13 @@ namespace fall_monitoring::infrastructure::storage
             "event_status TEXT NOT NULL,"
             "upload_status TEXT NOT NULL DEFAULT 'PENDING',"
             "video_upload_status TEXT NOT NULL DEFAULT 'NONE',"
-            "video_retry_count INTEGER NOT NULL DEFAULT 0"
+            "video_retry_count INTEGER NOT NULL DEFAULT 0,"
+            "revision INTEGER NOT NULL DEFAULT 1"
             ");";
         if (!executeLocked(createAlerts)) return false;
 
         // 只补充历史数据库可能缺失的两列，不删除表、也不丢弃历史报警。
-        for (const auto* column : {"video_upload_status", "video_retry_count"})
+        for (const auto* column : {"video_upload_status", "video_retry_count", "revision"})
         {
             bool exists = false;
             if (!columnExistsLocked(column, exists)) return false;
@@ -175,11 +178,16 @@ namespace fall_monitoring::infrastructure::storage
             const std::string migration = std::string("ALTER TABLE alerts ADD COLUMN ") +
                 (std::string(column) == "video_upload_status"
                     ? "video_upload_status TEXT NOT NULL DEFAULT 'NONE';"
-                    : "video_retry_count INTEGER NOT NULL DEFAULT 0;");
+                    : std::string(column) == "video_retry_count"
+                        ? "video_retry_count INTEGER NOT NULL DEFAULT 0;"
+                        : "revision INTEGER NOT NULL DEFAULT 1;");
             if (!executeLocked(migration.c_str())) return false;
             SPDLOG_INFO("[Storage] 历史数据库迁移：新增字段 {}", column);
         }
 
+        if (!executeLocked(
+                "CREATE TABLE IF NOT EXISTS event_ingress ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL);")) return false;
         return executeLocked("CREATE INDEX IF NOT EXISTS idx_alerts_upload ON alerts(upload_status, id);") &&
                executeLocked("CREATE INDEX IF NOT EXISTS idx_alerts_video ON alerts(video_upload_status, id);");
     }
@@ -248,6 +256,154 @@ namespace fall_monitoring::infrastructure::storage
         }
     }
 
+    bool SqliteAlertRepository::stashIncoming(const domain::event::AlertEvent& raw)
+    {
+        try
+        {
+            nlohmann::json item;
+            item["event_id"] = raw.eventId;
+            item["event_type"] = domain::event::toString(raw.eventType);
+            item["timestamp"] = raw.timestamp;
+            item["person_track_id"] = raw.personTrackId;
+            item["trigger_x"] = raw.triggerBoxX;
+            item["trigger_y"] = raw.triggerBoxY;
+            item["keyword"] = raw.keyword;
+            item["video_path"] = raw.videoPath;
+            item["local_alarm_pretriggered"] = raw.localAlarmAlreadyRequested;
+            item["sources"] = nlohmann::json::array();
+            for (const auto source : raw.source)
+                item["sources"].push_back(domain::event::toString(source));
+            const auto encoded = item.dump();
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (db_ == nullptr) return false;
+            Statement stmt(db_, "INSERT INTO event_ingress(payload) VALUES(?);");
+            if (!stmt || !stmt.text(1, encoded) || sqlite3_step(stmt.get()) != SQLITE_DONE)
+            {
+                SPDLOG_CRITICAL("[Storage] 溢出报警无法持久化：{}", sqlite3_errmsg(db_));
+                return false;
+            }
+            return true;
+        }
+        catch (const std::exception& error)
+        {
+            SPDLOG_CRITICAL("[Storage] 序列化溢出报警失败：{}", error.what());
+            return false;
+        }
+    }
+
+    bool SqliteAlertRepository::loadIncoming(std::vector<application::ports::PendingIncomingEvent>& batch, std::size_t limit)
+    {
+        batch.clear();
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (db_ == nullptr || !validLimit(limit)) return false;
+        Statement stmt(db_, "SELECT id,payload FROM event_ingress ORDER BY id ASC LIMIT ?;");
+        if (!stmt || !stmt.integer(1, static_cast<int>(limit))) return false;
+        for (;;)
+        {
+            const int rc = sqlite3_step(stmt.get());
+            if (rc == SQLITE_DONE) return true;
+            if (rc != SQLITE_ROW)
+            {
+                SPDLOG_ERROR("[Storage] 读取报警溢出缓存失败：{}", sqlite3_errmsg(db_));
+                batch.clear();
+                return false;
+            }
+            try
+            {
+                application::ports::PendingIncomingEvent incoming;
+                incoming.rowId = sqlite3_column_int64(stmt.get(), 0);
+                const auto j = nlohmann::json::parse(readText(stmt.get(), 1));
+                const auto type = j.at("event_type").get<std::string>();
+                if (type == "FALL") incoming.event.eventType = domain::event::EventType::FALL;
+                else if (type == "HELP_REQUEST") incoming.event.eventType = domain::event::EventType::HELP_REQUEST;
+                else throw std::runtime_error("invalid event_type");
+                incoming.event.eventId = j.value("event_id", std::string{});
+                incoming.event.timestamp = j.at("timestamp").get<std::int64_t>();
+                incoming.event.personTrackId = j.value("person_track_id", -1);
+                incoming.event.triggerBoxX = j.value("trigger_x", 0);
+                incoming.event.triggerBoxY = j.value("trigger_y", 0);
+                incoming.event.keyword = j.value("keyword", std::string{});
+                incoming.event.videoPath = j.value("video_path", std::string{});
+                incoming.event.localAlarmAlreadyRequested = j.value("local_alarm_pretriggered", false);
+                for (const auto& rawSource : j.at("sources"))
+                {
+                    const auto source = rawSource.get<std::string>();
+                    if (source == "VISION") incoming.event.source.push_back(domain::event::EventSource::VISION);
+                    else if (source == "VOICE") incoming.event.source.push_back(domain::event::EventSource::VOICE);
+                    else throw std::runtime_error("invalid source");
+                }
+                batch.push_back(std::move(incoming));
+            }
+            catch (const std::exception& error)
+            {
+                // 保留损坏记录供人工检查，避免静默丢失报警。
+                SPDLOG_CRITICAL("[Storage] 报警溢出记录无法反序列化：{}", error.what());
+                batch.clear();
+                return false;
+            }
+        }
+    }
+
+    bool SqliteAlertRepository::eraseIncoming(std::int64_t rowId)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (db_ == nullptr || rowId <= 0) return false;
+        Statement stmt(db_, "DELETE FROM event_ingress WHERE id=?;");
+        if (!stmt || !stmt.integer64(1, rowId) || sqlite3_step(stmt.get()) != SQLITE_DONE)
+        {
+            SPDLOG_ERROR("[Storage] 清理已处理报警缓存失败：{}", sqlite3_errmsg(db_));
+            return false;
+        }
+        return sqlite3_changes(db_) == 1;
+    }
+
+    bool SqliteAlertRepository::reconcileRecordedVideos(std::size_t limit, std::size_t offset, std::size_t& scanned)
+    {
+        scanned = 0;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (db_ == nullptr || !validLimit(limit) || offset > static_cast<std::size_t>(std::numeric_limits<int>::max())) return false;
+        std::vector<std::pair<std::string, std::string>> candidates;
+        {
+            Statement stmt(db_,
+                "SELECT event_id,video_path FROM alerts "
+                "WHERE video_path<>'' AND video_upload_status IN ('NONE','FAILED') "
+                "ORDER BY id ASC LIMIT ? OFFSET ?;");
+            if (!stmt || !stmt.integer(1, static_cast<int>(limit)) || !stmt.integer(2, static_cast<int>(offset))) return false;
+            for (;;)
+            {
+                const int rc = sqlite3_step(stmt.get());
+                if (rc == SQLITE_DONE) break;
+                if (rc != SQLITE_ROW)
+                {
+                    SPDLOG_ERROR("[Storage] 扫描录像恢复候选失败：{}", sqlite3_errmsg(db_));
+                    return false;
+                }
+                candidates.emplace_back(readText(stmt.get(), 0), readText(stmt.get(), 1));
+            }
+        }
+        scanned = candidates.size();
+        for (const auto& [id, name] : candidates)
+        {
+            std::error_code ec;
+            const std::filesystem::path path(name);
+            if (path.extension() != ".mp4" ||
+                !std::filesystem::is_regular_file(path, ec) || ec ||
+                std::filesystem::file_size(path, ec) == 0 || ec) continue;
+            Statement update(db_,
+                "UPDATE alerts SET video_upload_status='PENDING',video_retry_count=0 "
+                "WHERE event_id=? AND video_path=? "
+                "AND video_upload_status IN ('NONE','FAILED');");
+            if (!update || !update.text(1, id) || !update.text(2, name) || sqlite3_step(update.get()) != SQLITE_DONE)
+            {
+                SPDLOG_ERROR("[Storage] 恢复已生成录像的上传状态失败：{}", id);
+                return false;
+            }
+            if (sqlite3_changes(db_) == 1)
+                SPDLOG_INFO("[Storage] 已发现完成的录像文件，恢复待上传任务：{}", id);
+        }
+        return true;
+    }
+
     bool SqliteAlertRepository::saveAlert(const domain::event::AlertEvent& event)
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -262,8 +418,8 @@ namespace fall_monitoring::infrastructure::storage
         // 同一 event_id 视觉语音融合时合并来源、位置和关键词，并重新标记 PENDING。
         constexpr const char* sql =
             "INSERT INTO alerts (event_id,device_id,deployment_area,event_type,sources,timestamp,"
-            "person_track_id,trigger_x,trigger_y,keyword,video_path,event_status,upload_status)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'PENDING')"
+            "person_track_id,trigger_x,trigger_y,keyword,video_path,event_status,revision,upload_status)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'PENDING')"
             " ON CONFLICT(event_id) DO UPDATE SET"
             " sources=excluded.sources,"
             " person_track_id=CASE WHEN excluded.person_track_id>=0 THEN excluded.person_track_id ELSE alerts.person_track_id END,"
@@ -272,7 +428,9 @@ namespace fall_monitoring::infrastructure::storage
             " keyword=CASE WHEN excluded.keyword<>'' THEN excluded.keyword ELSE alerts.keyword END,"
             " video_path=CASE WHEN excluded.video_path<>'' THEN excluded.video_path ELSE alerts.video_path END,"
             " deployment_area=excluded.deployment_area,"
-            " upload_status='PENDING';";
+            " revision=excluded.revision,"
+            " upload_status='PENDING'"
+            " WHERE excluded.revision>alerts.revision;";
 
         Statement stmt(db_, sql);
         if (!stmt) return false;
@@ -288,7 +446,8 @@ namespace fall_monitoring::infrastructure::storage
             !stmt.integer(9, event.triggerBoxY) ||
             !stmt.text(10, event.keyword) ||
             !stmt.text(11, event.videoPath) ||
-            !stmt.text(12, domain::event::toString(event.status)))
+            !stmt.text(12, domain::event::toString(event.status)) ||
+            !stmt.integer64(13, static_cast<std::int64_t>(event.revision)))
         {
             SPDLOG_ERROR("[Storage] SQLite 参数绑定失败：{}", sqlite3_errmsg(db_));
             return false;
@@ -303,20 +462,17 @@ namespace fall_monitoring::infrastructure::storage
         return true;
     }
 
-    bool SqliteAlertRepository::loadPendingAlerts(
-        std::vector<domain::event::AlertEvent>& result, std::size_t limit, std::size_t offset)
+    bool SqliteAlertRepository::loadPendingAlerts(std::vector<domain::event::AlertEvent>& result, std::size_t limit, std::size_t offset)
     {
         result.clear();
         std::lock_guard<std::mutex> lock(mutex_);
-        if (db_ == nullptr || !validLimit(limit) || offset > static_cast<std::size_t>(std::numeric_limits<int>::max()))
-            return false;
+        if (db_ == nullptr || !validLimit(limit) || offset > static_cast<std::size_t>(std::numeric_limits<int>::max())) return false;
         constexpr const char* sql =
             "SELECT event_id,device_id,deployment_area,event_type,sources,timestamp,"
-            "person_track_id,trigger_x,trigger_y,keyword,video_path,event_status "
+            "person_track_id,trigger_x,trigger_y,keyword,video_path,event_status,revision "
             "FROM alerts WHERE upload_status='PENDING' ORDER BY id ASC LIMIT ? OFFSET ?;";
         Statement stmt(db_, sql);
-        if (!stmt || !stmt.integer(1, static_cast<int>(limit)) || !stmt.integer(2, static_cast<int>(offset)))
-            return false;
+        if (!stmt || !stmt.integer(1, static_cast<int>(limit)) || !stmt.integer(2, static_cast<int>(offset))) return false;
         while (true)
         {
             const int rc = sqlite3_step(stmt.get());
@@ -340,6 +496,7 @@ namespace fall_monitoring::infrastructure::storage
             event.keyword = readText(stmt.get(), 9);
             event.videoPath = readText(stmt.get(), 10);
             event.status = statusFromText(readText(stmt.get(), 11));
+            event.revision = static_cast<std::uint64_t>(sqlite3_column_int64(stmt.get(), 12));
             result.push_back(std::move(event));
         }
     }
@@ -360,7 +517,7 @@ namespace fall_monitoring::infrastructure::storage
             "WHERE event_id=? AND upload_status='PENDING' AND device_id=? "
             "AND deployment_area=? AND event_type=? AND sources=? AND timestamp=? "
             "AND person_track_id=? AND trigger_x=? AND trigger_y=? AND keyword=? "
-            "AND video_path=? AND event_status=?;";
+            "AND video_path=? AND event_status=? AND revision=?;";
         Statement stmt(db_, sql);
         if (!stmt || !stmt.text(1, sent.eventId) || !stmt.text(2, sent.deviceId) ||
             !stmt.text(3, sent.deploymentArea) ||
@@ -371,7 +528,8 @@ namespace fall_monitoring::infrastructure::storage
             !stmt.integer(8, sent.triggerBoxX) ||
             !stmt.integer(9, sent.triggerBoxY) ||
             !stmt.text(10, sent.keyword) || !stmt.text(11, sent.videoPath) ||
-            !stmt.text(12, domain::event::toString(sent.status)))
+            !stmt.text(12, domain::event::toString(sent.status)) ||
+            !stmt.integer64(13, static_cast<std::int64_t>(sent.revision)))
         {
             SPDLOG_ERROR("[Storage] 业务 ACK SQL 参数绑定失败：{}", sqlite3_errmsg(db_));
             return Result::Error;
@@ -433,18 +591,15 @@ namespace fall_monitoring::infrastructure::storage
         return sqlite3_changes(db_) == 1 || rowExistsLocked(eventId);
     }
 
-    bool SqliteAlertRepository::loadPendingVideos(
-        std::vector<application::ports::PendingVideoUpload>& result, std::size_t limit, std::size_t offset)
+    bool SqliteAlertRepository::loadPendingVideos(std::vector<application::ports::PendingVideoUpload>& result, std::size_t limit, std::size_t offset)
     {
         result.clear();
         std::lock_guard<std::mutex> lock(mutex_);
-        if (db_ == nullptr || !validLimit(limit) || offset > static_cast<std::size_t>(std::numeric_limits<int>::max()))
-            return false;
+        if (db_ == nullptr || !validLimit(limit) || offset > static_cast<std::size_t>(std::numeric_limits<int>::max())) return false;
         Statement stmt(db_,
             "SELECT event_id,video_path,video_retry_count FROM alerts "
             "WHERE video_upload_status='PENDING' AND video_path<>'' ORDER BY id ASC LIMIT ? OFFSET ?;");
-        if (!stmt || !stmt.integer(1, static_cast<int>(limit)) || !stmt.integer(2, static_cast<int>(offset)))
-            return false;
+        if (!stmt || !stmt.integer(1, static_cast<int>(limit)) || !stmt.integer(2, static_cast<int>(offset))) return false;
         while (true)
         {
             const int rc = sqlite3_step(stmt.get());
@@ -480,8 +635,7 @@ namespace fall_monitoring::infrastructure::storage
         return readText(stmt.get(), 0) == "UPLOADED" ? State::Uploaded : State::Pending;
     }
 
-    application::ports::VideoCommitResult SqliteAlertRepository::markVideoUploadedIfMatches(
-        const std::string& eventId, const std::string& videoPath)
+    application::ports::VideoCommitResult SqliteAlertRepository::markVideoUploadedIfMatches(const std::string& eventId, const std::string& videoPath)
     {
         using Result = application::ports::VideoCommitResult;
         std::lock_guard<std::mutex> lock(mutex_);
@@ -489,7 +643,8 @@ namespace fall_monitoring::infrastructure::storage
         Statement stmt(db_,
             "UPDATE alerts SET video_upload_status='UPLOADED' "
             "WHERE event_id=? AND video_path=? AND video_upload_status='PENDING';");
-        if (!stmt || !stmt.text(1, eventId) || !stmt.text(2, videoPath) || sqlite3_step(stmt.get()) != SQLITE_DONE)
+        if (!stmt || !stmt.text(1, eventId) || !stmt.text(2, videoPath) ||
+            sqlite3_step(stmt.get()) != SQLITE_DONE)
         {
             SPDLOG_ERROR("[Storage] 录像条件确认失败：event_id={}，error={}", eventId, sqlite3_errmsg(db_));
             return Result::Error;
@@ -516,8 +671,8 @@ namespace fall_monitoring::infrastructure::storage
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (db_ == nullptr || eventId.empty()) return false;
-        Statement stmt(db_,
-            "UPDATE alerts SET video_upload_status='UPLOADED' WHERE event_id=? AND video_upload_status='PENDING';");
+
+        Statement stmt(db_, "UPDATE alerts SET video_upload_status='UPLOADED' WHERE event_id=? AND video_upload_status='PENDING';");
         if (!stmt || !stmt.text(1, eventId) || sqlite3_step(stmt.get()) != SQLITE_DONE)
         {
             SPDLOG_ERROR("[Storage] 更新录像上传状态失败：event_id={}，error={}", eventId, sqlite3_errmsg(db_));

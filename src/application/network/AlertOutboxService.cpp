@@ -33,6 +33,9 @@ namespace fall_monitoring::application::network
 
     bool AlertOutboxService::start()
     {
+        if (running_.load()) return true;
+        // 线程异常退出后先回收其 std::thread 对象，再将服务标记为运行。
+        if (worker_.joinable()) worker_.join();
         if (running_.exchange(true)) return true;
         mqtt_.setMessageHandler([this](const std::string& topic, const std::string& payload) {
             enqueueMessage(topic, payload);
@@ -100,7 +103,9 @@ namespace fall_monitoring::application::network
     {
         // 从 Paho 回调转移到工作线程后才做 JSON 解析、SQLite 操作。
         const auto json = nlohmann::json::parse(payload, nullptr, false);
-        if (json.is_discarded() || !json.is_object() || !json.contains("event_id") || !json["event_id"].is_string() || !json.contains("status") || !json["status"].is_string())
+        if (json.is_discarded() || !json.is_object() ||
+            !json.contains("event_id") || !json["event_id"].is_string() ||
+            !json.contains("status") || !json["status"].is_string())
         {
             SPDLOG_WARN("[Outbox] 忽略格式错误的业务 ACK");
             return;
@@ -119,7 +124,28 @@ namespace fall_monitoring::application::network
             SPDLOG_DEBUG("[Outbox] 忽略未关联发送记录的 ACK：id={}", id);
             return;
         }
-        const auto result = repository_.markAsUploadedIfMatches(found->second.event);
+        // 旧版 ACK 只有 event_id/status，无法识别多个融合版本。
+        // 对 revision > 1 必须收到服务端回显的 revision，避免延迟的旧 ACK 误确认更新。
+        const auto& snapshot = found->second.event;
+        if (json.contains("revision"))
+        {
+            const auto& ackRevision = json["revision"];
+            if (!ackRevision.is_number_integer() ||
+                (ackRevision.is_number_unsigned()
+                    ? ackRevision.get<std::uint64_t>() != snapshot.revision
+                    : (ackRevision.get<std::int64_t>() <= 0 ||
+                       static_cast<std::uint64_t>(ackRevision.get<std::int64_t>()) != snapshot.revision)))
+            {
+                SPDLOG_WARN("[Outbox] 忽略版本不匹配的业务 ACK：event_id={}，当前发送 revision={}", id, snapshot.revision);
+                return;
+            }
+        }
+        else if (snapshot.revision > 1)
+        {
+            SPDLOG_WARN("[Outbox] 已融合报警需要版本 ACK：event_id={}，revision={}；请升级云端 ACK 回显", id, snapshot.revision);
+            return;
+        }
+        const auto result = repository_.markAsUploadedIfMatches(snapshot);
         switch (result)
         {
             case ports::AckCommitResult::Uploaded:
@@ -232,8 +258,7 @@ namespace fall_monitoring::application::network
         payload["cpu_usage"] = metrics->cpu;
         payload["memory_usage"] = metrics->memory;
         payload["storage_usage"] = metrics->storage;
-        payload["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        payload["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         if (!mqtt_.publish(statusTopic_, payload.dump(), 0))
             SPDLOG_WARN("[Outbox] 设备状态心跳发送失败");
         else
