@@ -7,11 +7,11 @@
 
 namespace 
 {
-    volatile std::sig_atomic_t g__keepRunning = 1;
+    volatile std::sig_atomic_t g_keepRunning = 1;
 
     void onStopSignal(int) noexcept
     {
-        g__keepRunning = 0;
+        g_keepRunning = 0;
     }
 }
 
@@ -33,7 +33,7 @@ int main(int argc, char* argv[])
     }
 
     bool fatal = false;
-    while (g__keepRunning != 0)
+    while (g_keepRunning != 0)
     {
         if (!app.tick())
         {
